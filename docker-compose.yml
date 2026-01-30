@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # ZOOKEEPER - Required for Kafka coordination
+  # ============================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - streaming_network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # KAFKA - Message broker for data streaming
+  # ============================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"      # External access
+      - "29092:29092"    # Internal container access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Listeners configuration:
+      # - PLAINTEXT_INTERNAL: For inter-container communication
+      # - PLAINTEXT_EXTERNAL: For host machine access
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT_INTERNAL:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka:29092,PLAINTEXT_EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+    networks:
+      - streaming_network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ============================================
+  # SPARK MASTER - Coordinates Spark workers
+  # ============================================
+  spark-master:
+    image: bitnami/spark:3.5.1
+    hostname: spark-master
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"   # Spark Master Web UI
+      - "7077:7077"   # Spark Master port
+    networks:
+      - streaming_network
+
+  # ============================================
+  # SPARK WORKER - Executes Spark tasks
+  # ============================================
+  spark-worker:
+    image: bitnami/spark:3.5.1
+    hostname: spark-worker
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    networks:
+      - streaming_network
+
+  # ============================================
+  # DATA PRODUCER - Streams dataset to Kafka
+  # ============================================
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: anomaly_stream
+    volumes:
+      - ./data:/app/data:ro  # Mount dataset directory
+    networks:
+      - streaming_network
+
+  # ============================================
+  # APP - Dash visualization + LSTM detection
+  # ============================================
+  app:
+    build: ./app
+    container_name: app
+    depends_on:
+      - kafka
+      - spark-master
+    ports:
+      - "8050:8050"   # Dash web interface
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: anomaly_stream
+      SPARK_MASTER: spark://spark-master:7077
+    networks:
+      - streaming_network
+
+networks:
+  streaming_network:
+    driver: bridge
