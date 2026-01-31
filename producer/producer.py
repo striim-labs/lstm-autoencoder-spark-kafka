@@ -84,7 +84,7 @@ def stream_data(
             message = {
                 "timestamp": row["timestamp"].isoformat(),
                 "value": int(row["value"]),
-                "produced_at": datetime.isoformat(),
+                "produced_at": datetime.utcnow().isoformat(),
                 "sequence_id": total_messages
             }
 

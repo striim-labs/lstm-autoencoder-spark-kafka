@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # ============================================
   # ZOOKEEPER - Required for Kafka coordination
@@ -58,15 +56,13 @@ services:
   # SPARK MASTER - Coordinates Spark workers
   # ============================================
   spark-master:
-    image: bitnami/spark:3.5.1
+    image: apache/spark:3.5.3-python3
     hostname: spark-master
     container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     environment:
-      - SPARK_MODE=master
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
-      - SPARK_RPC_ENCRYPTION_ENABLED=no
-      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
-      - SPARK_SSL_ENABLED=no
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
       - SPARK_MASTER_WEBUI_PORT=8080
     ports:
       - "8080:8080"   # Spark Master Web UI
@@ -78,14 +74,13 @@ services:
   # SPARK WORKER - Executes Spark tasks
   # ============================================
   spark-worker:
-    image: bitnami/spark:3.5.1
+    image: apache/spark:3.5.3-python3
     hostname: spark-worker
     container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on:
       - spark-master
     environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
       - SPARK_WORKER_MEMORY=2G
       - SPARK_WORKER_CORES=2
     networks:
