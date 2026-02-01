@@ -58,7 +58,8 @@ def stream_data(
     topic: str,
     df: pd.DataFrame,
     delay_seconds: float = 0.1,
-    loop: bool = True
+    loop: bool = True,
+    start_offset: int = 0
 ):
     """
     Stream taxi data to Kafka topic.
@@ -69,7 +70,17 @@ def stream_data(
         df: DataFrame containing taxi data
         delay_seconds: Delay between messages (simulates real-time)
         loop: Whether to continuously loop through data
+        start_offset: Record index to start streaming from (useful for
+                      skipping training data when using LSTM detector)
     """
+    # Apply starting offset
+    if start_offset > 0:
+        if start_offset >= len(df):
+            logger.error(f"Start offset {start_offset} >= data length {len(df)}")
+            return
+        df = df.iloc[start_offset:].reset_index(drop=True)
+        logger.info(f"Starting from record {start_offset}, {len(df)} records remaining")
+
     logger.info(f"Starting to stream data to topic '{topic}'")
     logger.info(f"Delay between messages: {delay_seconds}s, Loop: {loop}")
 
@@ -138,12 +149,47 @@ def wait_for_kafka(bootstrap_servers: str, max_retries: int = 30, retry_interval
     raise RuntimeError(f"Could not connect to Kafka after {max_retries} attempts")
 
 
+def wait_for_app_ready(app_url: str, max_retries: int = 60, retry_interval: int = 2):
+    """
+    Wait for the app's Spark streaming to be ready before producing.
+
+    Polls the app's /health endpoint until spark_ready is True.
+    """
+    import urllib.request
+    import urllib.error
+
+    health_url = f"{app_url}/health"
+    logger.info(f"Waiting for app to be ready at {health_url}...")
+
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(health_url, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                if data.get("spark_ready", False):
+                    logger.info(f"App is ready! Spark streaming connected.")
+                    return True
+                else:
+                    logger.info(f"App starting... (attempt {attempt + 1}/{max_retries})")
+        except urllib.error.URLError as e:
+            logger.debug(f"App not reachable yet (attempt {attempt + 1}/{max_retries}): {e}")
+        except Exception as e:
+            logger.debug(f"Health check failed (attempt {attempt + 1}/{max_retries}): {e}")
+
+        time.sleep(retry_interval)
+
+    logger.warning(f"App did not become ready after {max_retries} attempts, proceeding anyway")
+    return False
+
+
 def main():
     bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     topic = os.getenv("KAFKA_TOPIC", "anomaly_stream")
     data_path = os.getenv("DATA_PATH", "/app/data/nyc_taxi.csv")
     delay = float(os.getenv("MESSAGE_DELAY_SECONDS", "0.1"))
     loop_data = os.getenv("LOOP_DATA", "true").lower() == "true"
+    start_offset = int(os.getenv("START_OFFSET", "0"))
+    app_url = os.getenv("APP_URL", "http://app:8050")
+    wait_for_app = os.getenv("WAIT_FOR_APP", "true").lower() == "true"
 
     logger.info("=" * 50)
     logger.info("NYC Taxi Data Kafka Producer")
@@ -153,16 +199,27 @@ def main():
     logger.info(f"Data Path: {data_path}")
     logger.info(f"Message Delay: {delay}s")
     logger.info(f"Loop Data: {loop_data}")
+    logger.info(f"Start Offset: {start_offset}")
+    logger.info(f"Wait for App: {wait_for_app}")
     logger.info("=" * 50)
 
     wait_for_kafka(bootstrap_servers)
+
+    # Wait for app's Spark streaming to be ready before producing
+    if wait_for_app:
+        wait_for_app_ready(app_url)
 
     producer = create_producer(bootstrap_servers)
 
     df = load_taxi_data(data_path)
 
     try:
-        stream_data(producer, topic, df, delay_seconds=delay, loop=loop_data)
+        stream_data(
+            producer, topic, df,
+            delay_seconds=delay,
+            loop=loop_data,
+            start_offset=start_offset
+        )
     except KeyboardInterrupt:
         logger.info("Received shutdown signal")
     finally:

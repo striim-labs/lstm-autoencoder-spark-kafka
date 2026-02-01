@@ -8,12 +8,14 @@ detection parameters.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+
+from base_detector import BaseDetector
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ class DetectorConfig:
     feature_columns: list = field(default_factory=lambda: ["value"])
 
 
-class IsolationForestDetector:
+class IsolationForestDetector(BaseDetector):
     """
     Sliding window anomaly detector using Isolation Forest.
 
@@ -40,14 +42,14 @@ class IsolationForestDetector:
         config: DetectorConfig with detection parameters
         model: Fitted IsolationForest model
         scaler: StandardScaler for feature normalization
-        is_fitted: Whether the model has been fitted
+        _is_fitted: Whether the model has been fitted
     """
 
     def __init__(self, config: Optional[DetectorConfig] = None):
         self.config = config or DetectorConfig()
         self.model: Optional[IsolationForest] = None
         self.scaler: Optional[StandardScaler] = None
-        self.is_fitted: bool = False
+        self._is_fitted: bool = False
 
         logger.info(f"Initialized IsolationForestDetector with config: {self.config}")
 
@@ -122,7 +124,7 @@ class IsolationForestDetector:
             n_jobs=-1  # Use all available cores
         )
         self.model.fit(features_scaled)
-        self.is_fitted = True
+        self._is_fitted = True
 
         logger.debug(f"Fitted Isolation Forest on {len(df)} samples")
 
@@ -148,7 +150,7 @@ class IsolationForestDetector:
         # Fit on current window
         self.fit(df)
 
-        if not self.is_fitted or self.model is None or self.scaler is None:
+        if not self._is_fitted or self.model is None or self.scaler is None:
             return pd.DataFrame()
 
         # Prepare and scale features
@@ -190,7 +192,7 @@ class IsolationForestDetector:
         Returns:
             True if the point is anomalous, False otherwise
         """
-        if not self.is_fitted or self.model is None or self.scaler is None:
+        if not self._is_fitted or self.model is None or self.scaler is None:
             return False
 
         # Append new point to calculate features with context
@@ -207,12 +209,27 @@ class IsolationForestDetector:
 
         return prediction[0] == -1
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> Dict[str, Any]:
         """Get detector statistics."""
         return {
-            "is_fitted": self.is_fitted,
+            "is_fitted": self._is_fitted,
             "window_size": self.config.window_size,
             "min_samples": self.config.min_samples,
             "contamination": self.config.contamination,
             "n_estimators": self.config.n_estimators,
         }
+
+    def get_name(self) -> str:
+        """Get the detector name for display purposes."""
+        return "Isolation Forest"
+
+    @property
+    def is_ready(self) -> bool:
+        """Check if the detector is ready to perform detection."""
+        # Isolation Forest is always ready - it fits on demand
+        return True
+
+    @property
+    def min_samples_required(self) -> int:
+        """Minimum number of samples required for detection."""
+        return self.config.min_samples

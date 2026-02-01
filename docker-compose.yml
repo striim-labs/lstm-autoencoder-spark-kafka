@@ -89,6 +89,10 @@ services:
   # ============================================
   # DATA PRODUCER - Streams dataset to Kafka
   # ============================================
+  # For LSTM detector, set START_OFFSET=4992 to skip training/validation data
+  # and only stream test data (week 2014-42 onwards, matching evaluate.py).
+  # The dataset starts mid-week, so record 4992 aligns with the first complete test week.
+  # Producer waits for app's /health endpoint to confirm Spark is ready.
   producer:
     build: ./producer
     container_name: producer
@@ -98,14 +102,22 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: anomaly_stream
+      MESSAGE_DELAY_SECONDS: ${MESSAGE_DELAY_SECONDS:-0.1}
+      START_OFFSET: ${START_OFFSET:-0}
+      LOOP_DATA: ${LOOP_DATA:-true}
+      APP_URL: http://app:8050
+      WAIT_FOR_APP: ${WAIT_FOR_APP:-true}
     volumes:
       - ./data:/app/data:ro  # Mount dataset directory
     networks:
       - streaming_network
 
   # ============================================
-  # APP - Dash visualization + LSTM detection
+  # APP - Dash visualization + anomaly detection
   # ============================================
+  # Supports two detector types via DETECTOR_TYPE env var:
+  #   - isolation_forest (default): Real-time sliding window detection
+  #   - lstm: LSTM Encoder-Decoder with pre-trained model
   app:
     build: ./app
     container_name: app
@@ -118,6 +130,17 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: anomaly_stream
       SPARK_MASTER: spark://spark-master:7077
+      # Detector configuration
+      DETECTOR_TYPE: ${DETECTOR_TYPE:-isolation_forest}
+      WINDOW_SIZE: ${WINDOW_SIZE:-200}
+      MIN_SAMPLES: ${MIN_SAMPLES:-50}
+      CONTAMINATION: ${CONTAMINATION:-0.05}
+      # LSTM model paths (relative to /app in container)
+      MODEL_PATH: models/lstm_model.pt
+      SCALER_PATH: models/scaler.pkl
+      SCORER_PATH: models/scorer.pkl
+    volumes:
+      - ./models:/app/models:ro  # Mount trained models (read-only)
     networks:
       - streaming_network
 
