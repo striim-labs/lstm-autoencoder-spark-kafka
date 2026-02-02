@@ -248,6 +248,12 @@ def save_training_artifacts(
         pickle.dump(history, f)
     logger.info(f"Saved training history to {history_path}")
 
+    # Save preprocessor config (data split configuration)
+    config_path = output_dir / "preprocessor_config.pkl"
+    with open(config_path, "wb") as f:
+        pickle.dump(preprocessor.config, f)
+    logger.info(f"Saved preprocessor config to {config_path}")
+
 
 def load_model(model_path: str, device: torch.device) -> EncDecAD:
     """
@@ -318,7 +324,7 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-3,
+        default=5e-4,
         help="Learning rate"
     )
     parser.add_argument(
@@ -336,8 +342,26 @@ def main():
     parser.add_argument(
         "--threshold-percentile",
         type=float,
-        default=95.0,
+        default=99.99,
         help="Percentile for anomaly threshold"
+    )
+    parser.add_argument(
+        "--train-weeks",
+        type=int,
+        default=8,
+        help="Number of normal weeks for training"
+    )
+    parser.add_argument(
+        "--val-weeks",
+        type=int,
+        default=2,
+        help="Number of normal weeks for early stopping validation"
+    )
+    parser.add_argument(
+        "--threshold-weeks",
+        type=int,
+        default=4,
+        help="Number of normal weeks for threshold calibration"
     )
     args = parser.parse_args()
 
@@ -360,7 +384,12 @@ def main():
     print("Step 1: Preprocessing data")
     print("-" * 40)
 
-    preprocessor = NYCTaxiPreprocessor()
+    config = PreprocessorConfig(
+        train_weeks=args.train_weeks,
+        val_weeks=args.val_weeks,
+        threshold_weeks=args.threshold_weeks
+    )
+    preprocessor = NYCTaxiPreprocessor(config=config)
     dataloaders, normalized_splits = preprocessor.preprocess(
         args.data_path,
         batch_size=args.batch_size
@@ -408,10 +437,11 @@ def main():
         config=ScorerConfig(threshold_percentile=args.threshold_percentile)
     )
 
-    # Fit error distribution on training data
-    scorer.fit(model, dataloaders["train"], device)
+    # Fit error distribution on validation data (paper recommendation: vN1)
+    # The model hasn't optimized on val data, so errors there are more realistic
+    scorer.fit(model, dataloaders["val"], device)
 
-    # Set threshold using threshold validation set
+    # Set threshold using percentile method on normal validation data
     val_scores, _ = scorer.compute_scores(
         model, dataloaders["threshold_val"], device
     )
@@ -487,6 +517,7 @@ def main():
     print("  - scaler.pkl")
     print("  - scorer.pkl")
     print("  - training_history.pkl")
+    print("  - preprocessor_config.pkl")
 
 
 if __name__ == "__main__":
