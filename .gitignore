@@ -215,3 +215,6 @@ kaggle.json
 **/.DS_Store
 
 models/
+
+optimization_results/**
+project_structure.md

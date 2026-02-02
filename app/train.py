@@ -294,7 +294,7 @@ def main():
     parser.add_argument(
         "--hidden-dim",
         type=int,
-        default=64,
+        default=32,
         help="LSTM hidden dimension"
     )
     parser.add_argument(
@@ -318,7 +318,7 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-3,
+        default=5e-4,
         help="Learning rate"
     )
     parser.add_argument(
@@ -342,19 +342,19 @@ def main():
     parser.add_argument(
         "--train-weeks",
         type=int,
-        default=9,
+        default=8,
         help="Number of normal weeks for training"
     )
     parser.add_argument(
         "--val-weeks",
         type=int,
-        default=3,
+        default=2,
         help="Number of normal weeks for early stopping validation"
     )
     parser.add_argument(
         "--threshold-weeks",
         type=int,
-        default=2,
+        default=4,
         help="Number of normal weeks for threshold calibration"
     )
     args = parser.parse_args()
