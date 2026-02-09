@@ -217,3 +217,7 @@ kaggle.json
 optimization_results/**
 project_structure.md
 plan.md
+models/credit_card/**
+models/credit_card_fix1_2/**
+models/credit_card_fix1_2_4/**
+data/creditcard.csv
