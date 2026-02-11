@@ -158,25 +158,43 @@ class LSTMStreamingDetector(BaseDetector):
         Compute anomaly score and point-wise errors for a sequence.
 
         Supports both point-level (Malhotra paper) and window-level (legacy) scoring.
+        Handles both univariate (seq_len,) and multivariate (seq_len, num_features) input.
+
+        For multivariate input with DoW conditioning:
+        - Channel 0: normalized transaction count
+        - Channels 1-2: DoW sin/cos features
+        - Errors are computed on all channels but scoring uses channel 0
 
         Args:
-            sequence: Normalized sequence of shape (seq_len,)
+            sequence: Normalized sequence of shape (seq_len,) or (seq_len, num_features)
 
         Returns:
             Tuple of (is_anomaly, window_score, point_scores, point_predictions, raw_errors)
-            - raw_errors: Absolute reconstruction errors for localization
+            - raw_errors: Absolute reconstruction errors for localization (channel 0 only for multivariate)
         """
         if self.model is None or self.scorer is None:
-            return False, 0.0, np.zeros_like(sequence), np.zeros_like(sequence, dtype=bool), np.zeros_like(sequence)
+            seq_len = sequence.shape[0] if sequence.ndim >= 1 else len(sequence)
+            return False, 0.0, np.zeros(seq_len), np.zeros(seq_len, dtype=bool), np.zeros(seq_len)
 
-        # Reshape for model: (1, seq_len, 1)
-        x = torch.FloatTensor(sequence).unsqueeze(0).unsqueeze(-1).to(self.device)
+        # Determine input shape based on sequence dimensionality
+        if sequence.ndim == 1:
+            # Univariate: (seq_len,) -> (1, seq_len, 1)
+            x = torch.FloatTensor(sequence).unsqueeze(0).unsqueeze(-1).to(self.device)
+        else:
+            # Multivariate: (seq_len, num_features) -> (1, seq_len, num_features)
+            x = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             x_reconstructed = self.model(x)
 
         # Compute point-wise error
-        error = torch.abs(x - x_reconstructed).cpu().numpy().squeeze()
+        error_full = torch.abs(x - x_reconstructed).cpu().numpy().squeeze()
+
+        # For multivariate, extract channel 0 error for scoring/localization
+        if error_full.ndim == 2:
+            error = error_full[:, 0]  # Channel 0 only (transaction count)
+        else:
+            error = error_full
 
         # Check if point-level scoring is available
         use_point_level = (
@@ -243,12 +261,35 @@ class LSTMStreamingDetector(BaseDetector):
             )
             return pd.DataFrame()
 
-        # Extract values and normalize
+        # Extract values and normalize (channel 0 only)
         values = df["value"].values.astype(float).reshape(-1, 1)
         values_normalized = self.scaler.transform(values).flatten()
 
-        # Analyze the most recent complete window
-        window_data = values_normalized[-self.window_size:]
+        # Check if model expects DoW features (input_dim > 1)
+        model_input_dim = self.model.config.input_dim if hasattr(self.model, 'config') else 1
+        use_dow_features = model_input_dim == 3
+
+        # Prepare window data
+        window_values = values_normalized[-self.window_size:]
+
+        if use_dow_features:
+            # Add DoW cyclical features for transaction models
+            window_df = df.tail(self.window_size).copy()
+            timestamps = pd.to_datetime(window_df["timestamp"])
+
+            # Get the day of week for the start of the window (constant for daily windows)
+            dow = timestamps.iloc[0].dayofweek  # 0=Mon, 6=Sun
+            dow_sin = np.sin(2 * np.pi * dow / 7)
+            dow_cos = np.cos(2 * np.pi * dow / 7)
+
+            # Create 3-channel input: (seq_len, 3)
+            window_data = np.zeros((len(window_values), 3), dtype=np.float32)
+            window_data[:, 0] = window_values
+            window_data[:, 1] = dow_sin  # Broadcast to all timesteps
+            window_data[:, 2] = dow_cos
+        else:
+            window_data = window_values
+
         is_anomaly, window_score, point_scores, point_predictions, raw_errors = self._compute_sequence_score_and_errors(
             window_data
         )
@@ -355,13 +396,33 @@ class LSTMStreamingDetector(BaseDetector):
         if len(values) < self.window_size:
             return None
 
-        # Normalize
+        # Normalize (channel 0 only)
         values_array = np.array(values[-self.window_size:]).reshape(-1, 1)
         values_normalized = self.scaler.transform(values_array).flatten()
 
+        # Check if model expects DoW features (input_dim > 1)
+        model_input_dim = self.model.config.input_dim if hasattr(self.model, 'config') else 1
+        use_dow_features = model_input_dim == 3
+
+        if use_dow_features:
+            # Add DoW cyclical features
+            window_timestamps = timestamps[-self.window_size:]
+            ts = pd.to_datetime(window_timestamps[0])
+            dow = ts.dayofweek  # 0=Mon, 6=Sun
+            dow_sin = np.sin(2 * np.pi * dow / 7)
+            dow_cos = np.cos(2 * np.pi * dow / 7)
+
+            # Create 3-channel input: (seq_len, 3)
+            window_data = np.zeros((len(values_normalized), 3), dtype=np.float32)
+            window_data[:, 0] = values_normalized
+            window_data[:, 1] = dow_sin
+            window_data[:, 2] = dow_cos
+        else:
+            window_data = values_normalized
+
         # Compute score
         is_anomaly, window_score, point_scores, point_predictions, raw_errors = self._compute_sequence_score_and_errors(
-            values_normalized
+            window_data
         )
 
         if is_anomaly:

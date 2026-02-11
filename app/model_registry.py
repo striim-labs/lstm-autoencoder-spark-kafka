@@ -39,9 +39,13 @@ class TransactionModelConfig:
     - Shorter sequences (24 vs 336) allow smaller hidden dim
     - Single layer sufficient for daily patterns
     - Light dropout for regularization
+
+    Day-of-week conditioning:
+    - input_dim=3: transaction count + sin(DoW) + cos(DoW)
+    - hidden_dim=12: restores bottleneck ratio h/L ≈ 0.5
     """
-    input_dim: int = 1           # Univariate hourly count
-    hidden_dim: int = 32         # Smaller for 24-step sequences
+    input_dim: int = 3           # Transaction count + DoW sin/cos features
+    hidden_dim: int = 18         # Bottleneck for DoW conditioning (was 32, trying 16)
     num_layers: int = 1          # Single layer sufficient
     dropout: float = 0.15        # Light regularization
     sequence_length: int = 24    # Daily windows
@@ -379,17 +383,23 @@ class ModelRegistry:
 
         # Step 1: Fit error distribution on validation data (normal only)
         scorer.fit(model, val_loader, self.device)
-        logger.info(f"  {combo}: Error distribution fitted (μ={scorer.mu_point[0]:.4f}, σ²={scorer.sigma_point[0]:.4f})")
+        if scorer.sigma_point is not None:
+            logger.info(f"  {combo}: Error distribution fitted (μ={scorer.mu_point[0]:.4f}, σ²={scorer.sigma_point[0]:.4f})")
+        else:
+            logger.info(f"  {combo}: Error distribution fitted (μ shape={scorer.mu_point.shape}, cov shape={scorer.cov_point.shape})")
 
         # Step 2: Extract calibration windows from preprocessor
-        all_windows = preprocessor.combo_windows[combo]  # Shape: (30, 24)
+        all_windows = preprocessor.combo_windows[combo]  # Shape: (30, 24, 3) with DoW conditioning
         window_info = preprocessor.combo_window_info[combo]
+
+        # Check if windows have DoW features (3D)
+        has_dow_features = all_windows.ndim == 3 and all_windows.shape[2] == 3
 
         # Get normal windows for calibration
         normal_windows = []
         for day_idx in normal_day_indices:
             if day_idx < len(all_windows):
-                normal_windows.append(all_windows[day_idx])
+                normal_windows.append(all_windows[day_idx].copy())
                 logger.debug(f"    Normal: Day {day_idx} ({window_info[day_idx]['day_name']})")
 
         normal_windows = np.array(normal_windows)
@@ -404,21 +414,51 @@ class ModelRegistry:
         logger.debug(f"    Spike source: Day {spike_day_index} ({window_info[spike_day_index]['day_name']})")
         logger.debug(f"    Dip source: Day {dip_day_index} ({window_info[dip_day_index]['day_name']})")
 
-        # Create synthetic anomalies
+        # Create synthetic anomalies - inject into channel 0 only (transaction count)
         generator = SyntheticAnomalyGenerator(SyntheticAnomalyConfig())
-        spike_window = generator.inject_spike_at_hours(
-            spike_source, spike_hours[0], spike_hours[1], magnitude_sigma
-        )
-        dip_window = generator.inject_dip_at_hours(
-            dip_source, dip_hours[0], dip_hours[1], magnitude_sigma
-        )
+        if has_dow_features:
+            # Extract channel 0 for anomaly injection, preserve DoW features
+            spike_counts = spike_source[:, 0].copy()
+            dip_counts = dip_source[:, 0].copy()
+
+            spike_counts = generator.inject_spike_at_hours(
+                spike_counts, spike_hours[0], spike_hours[1], magnitude_sigma
+            )
+            dip_counts = generator.inject_dip_at_hours(
+                dip_counts, dip_hours[0], dip_hours[1], magnitude_sigma
+            )
+
+            # Reconstruct 3D windows with injected anomalies
+            spike_window = spike_source.copy()
+            spike_window[:, 0] = spike_counts
+            dip_window = dip_source.copy()
+            dip_window[:, 0] = dip_counts
+        else:
+            spike_window = generator.inject_spike_at_hours(
+                spike_source, spike_hours[0], spike_hours[1], magnitude_sigma
+            )
+            dip_window = generator.inject_dip_at_hours(
+                dip_source, dip_hours[0], dip_hours[1], magnitude_sigma
+            )
 
         anomaly_windows = np.array([spike_window, dip_window])
 
-        # Normalize windows using the combo's scaler
+        # Normalize windows using the combo's scaler (channel 0 only for 3D)
         scaler = self.scalers[combo]
-        normal_norm = scaler.transform(normal_windows.reshape(-1, 1)).reshape(normal_windows.shape)
-        anomaly_norm = scaler.transform(anomaly_windows.reshape(-1, 1)).reshape(anomaly_windows.shape)
+        if has_dow_features:
+            # Normalize channel 0 only, preserve DoW features
+            normal_norm = normal_windows.copy()
+            normal_counts = normal_windows[:, :, 0].flatten().reshape(-1, 1)
+            normal_counts_norm = scaler.transform(normal_counts)
+            normal_norm[:, :, 0] = normal_counts_norm.reshape(normal_windows.shape[0], normal_windows.shape[1])
+
+            anomaly_norm = anomaly_windows.copy()
+            anomaly_counts = anomaly_windows[:, :, 0].flatten().reshape(-1, 1)
+            anomaly_counts_norm = scaler.transform(anomaly_counts)
+            anomaly_norm[:, :, 0] = anomaly_counts_norm.reshape(anomaly_windows.shape[0], anomaly_windows.shape[1])
+        else:
+            normal_norm = scaler.transform(normal_windows.reshape(-1, 1)).reshape(normal_windows.shape)
+            anomaly_norm = scaler.transform(anomaly_windows.reshape(-1, 1)).reshape(anomaly_windows.shape)
 
         # Create DataLoaders
         normal_dataset = TimeSeriesDataset(normal_norm)

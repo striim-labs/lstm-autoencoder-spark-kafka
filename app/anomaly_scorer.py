@@ -145,7 +145,11 @@ class AnomalyScorer:
                 logger.info(f"  cov_point shape: {self.cov_point.shape}")
 
             # Also fit window-level for backward compatibility
-            all_errors_squeezed = all_errors.squeeze(-1)  # (num_sequences, seq_len)
+            # For multivariate, use channel 0 (transaction count) for window-level scoring
+            if num_features > 1:
+                all_errors_squeezed = all_errors[:, :, 0]  # Extract channel 0
+            else:
+                all_errors_squeezed = all_errors.squeeze(-1)  # (num_sequences, seq_len)
             self.mu = np.mean(all_errors_squeezed, axis=0)
             errors_centered = all_errors_squeezed - self.mu
             self.cov = np.cov(errors_centered, rowvar=False)
@@ -223,8 +227,14 @@ class AnomalyScorer:
                 x = batch.to(device)
                 x_reconstructed = model(x)
 
-                # Point-wise absolute error: (batch, seq_len)
-                errors = torch.abs(x - x_reconstructed).cpu().numpy().squeeze(-1)
+                # Point-wise absolute error: (batch, seq_len, m)
+                errors_full = torch.abs(x - x_reconstructed).cpu().numpy()
+
+                # For multivariate, use channel 0 for window-level Mahalanobis distance
+                if errors_full.shape[-1] > 1:
+                    errors = errors_full[:, :, 0]  # Extract channel 0
+                else:
+                    errors = errors_full.squeeze(-1)  # (batch, seq_len)
 
                 # Compute Mahalanobis distance for each sequence in batch
                 for error in errors:

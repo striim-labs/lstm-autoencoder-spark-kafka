@@ -41,9 +41,12 @@ def plot_daily_reconstruction(
     """
     Plot original, reconstructed, and error for a 24-hour window.
 
+    For multivariate input with DoW conditioning, only channel 0 (transaction count)
+    is visualized.
+
     Args:
         model: Trained LSTM-AE model
-        sequence: Input sequence, shape (24,) or (24, 1)
+        sequence: Input sequence, shape (24,), (24, 1), or (24, 3) for DoW conditioning
         day_info: Dict with day metadata (day_index, date, day_name)
         window_score: Window-level anomaly score
         prediction: True if predicted as anomaly
@@ -56,17 +59,30 @@ def plot_daily_reconstruction(
 
     model.eval()
 
-    # Prepare input
+    # Handle different input shapes
     if sequence.ndim == 1:
-        sequence = sequence.reshape(-1, 1)
+        # Shape: (24,) -> (24, 1)
+        sequence_input = sequence.reshape(-1, 1)
+    elif sequence.ndim == 2 and sequence.shape[1] == 3:
+        # Shape: (24, 3) - DoW conditioning, keep all channels for model
+        sequence_input = sequence
+    else:
+        # Shape: (24, 1)
+        sequence_input = sequence
 
-    x = torch.FloatTensor(sequence).unsqueeze(0).to(device)
+    x = torch.FloatTensor(sequence_input).unsqueeze(0).to(device)
 
     with torch.no_grad():
         x_reconstructed = model(x)
 
-    original = sequence.squeeze()
-    reconstructed = x_reconstructed.cpu().numpy().squeeze()
+    # Extract channel 0 for visualization (transaction count)
+    if sequence_input.shape[-1] == 3:
+        original = sequence_input[:, 0]  # Channel 0 only
+        reconstructed = x_reconstructed.cpu().numpy().squeeze()[:, 0]
+    else:
+        original = sequence_input.squeeze()
+        reconstructed = x_reconstructed.cpu().numpy().squeeze()
+
     error = np.abs(original - reconstructed)
 
     # Create figure
@@ -124,9 +140,12 @@ def plot_normal_reconstructions(
     """
     Grid of correctly predicted normal sequences.
 
+    For multivariate input with DoW conditioning, only channel 0 (transaction count)
+    is visualized.
+
     Args:
         model: Trained LSTM-AE model
-        sequences: All test sequences, shape (N, 24) or (N, 24, 1)
+        sequences: All test sequences, shape (N, 24), (N, 24, 1), or (N, 24, 3)
         window_info: List of window metadata dicts
         predictions: Boolean array of predictions (True=anomaly)
         device: Torch device
@@ -137,6 +156,9 @@ def plot_normal_reconstructions(
         return
 
     model.eval()
+
+    # Determine if DoW conditioning is used
+    has_dow = sequences.ndim == 3 and sequences.shape[2] == 3
 
     # Find correctly predicted normal windows
     normal_indices = [i for i, pred in enumerate(predictions) if not pred]
@@ -158,16 +180,25 @@ def plot_normal_reconstructions(
         seq = sequences[idx]
         info = window_info[idx]
 
+        # Handle different input shapes
         if seq.ndim == 1:
-            seq = seq.reshape(-1, 1)
+            seq_input = seq.reshape(-1, 1)
+        else:
+            seq_input = seq
 
-        x = torch.FloatTensor(seq).unsqueeze(0).to(device)
+        x = torch.FloatTensor(seq_input).unsqueeze(0).to(device)
 
         with torch.no_grad():
             x_reconstructed = model(x)
 
-        original = seq.squeeze()
-        reconstructed = x_reconstructed.cpu().numpy().squeeze()
+        # Extract channel 0 for visualization
+        if has_dow:
+            original = seq_input[:, 0]
+            reconstructed = x_reconstructed.cpu().numpy().squeeze()[:, 0]
+        else:
+            original = seq_input.squeeze()
+            reconstructed = x_reconstructed.cpu().numpy().squeeze()
+
         error = np.abs(original - reconstructed)
 
         hours = np.arange(len(original))
@@ -402,8 +433,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="evaluate/fiserv",
-        help="Directory to save evaluation outputs"
+        default="evaluate/fiserv/day_signal",
+        help="Directory to save evaluation outputs (day_signal for DoW conditioning)"
     )
     args = parser.parse_args()
 

@@ -37,17 +37,22 @@ class TimeSeriesDataset(Dataset):
     """
     PyTorch Dataset for daily time series sequences.
 
-    Each sample is a complete day of hourly transaction counts,
+    Each sample is a complete day of hourly transaction counts with DoW features,
     shaped as (sequence_length, num_features) for LSTM input.
+
+    With DoW conditioning: (num_days, 24, 3) where features are:
+        - Channel 0: normalized transaction count
+        - Channel 1: sin(2π * day_of_week / 7)
+        - Channel 2: cos(2π * day_of_week / 7)
     """
 
     def __init__(self, sequences: np.ndarray):
         """
         Args:
-            sequences: Array of shape (num_days, 24)
+            sequences: Array of shape (num_days, 24) or (num_days, 24, num_features)
         """
         self.sequences = torch.FloatTensor(sequences)
-        # Add feature dimension: (num_days, seq_len) -> (num_days, seq_len, 1)
+        # Add feature dimension if needed: (num_days, seq_len) -> (num_days, seq_len, 1)
         if self.sequences.ndim == 2:
             self.sequences = self.sequences.unsqueeze(-1)
 
@@ -173,9 +178,10 @@ class TransactionPreprocessor:
         hourly_df: Optional[pd.DataFrame] = None
     ) -> Tuple[np.ndarray, List[Dict]]:
         """
-        Segment hourly time series into daily windows (24 hours each).
+        Segment hourly time series into daily windows (24 hours each) with DoW features.
 
         Each window is tagged with metadata including day-of-week for analysis.
+        DoW cyclical encoding (sin/cos) is added as additional features.
 
         Args:
             combo: The (network_type, transaction_type) tuple
@@ -183,7 +189,10 @@ class TransactionPreprocessor:
 
         Returns:
             Tuple of:
-                - Array of shape (num_days, 24) containing counts
+                - Array of shape (num_days, 24, 3) containing:
+                    - Channel 0: transaction counts (to be normalized later)
+                    - Channel 1: sin(2π * day_of_week / 7)
+                    - Channel 2: cos(2π * day_of_week / 7)
                 - List of dicts with window metadata
         """
         if hourly_df is None:
@@ -208,20 +217,34 @@ class TransactionPreprocessor:
             day_start = pd.Timestamp(hours[start_idx])
             day_end = pd.Timestamp(hours[end_idx - 1])
 
-            windows.append(day_values)
+            # Compute DoW cyclical encoding (constant for all 24 hours in the window)
+            dow = day_start.dayofweek  # 0=Mon, 6=Sun
+            dow_sin = np.sin(2 * np.pi * dow / 7)
+            dow_cos = np.cos(2 * np.pi * dow / 7)
+
+            # Create 3-channel window: (24, 3)
+            # Channel 0: transaction count, Channel 1: DoW sin, Channel 2: DoW cos
+            window_3d = np.zeros((SAMPLES_PER_DAY, 3), dtype=np.float32)
+            window_3d[:, 0] = day_values
+            window_3d[:, 1] = dow_sin  # Broadcast to all 24 hours
+            window_3d[:, 2] = dow_cos  # Broadcast to all 24 hours
+
+            windows.append(window_3d)
             window_info.append({
                 "day_index": d,
                 "start_time": day_start,
                 "end_time": day_end,
-                "day_of_week": day_start.dayofweek,  # 0=Mon, 6=Sun
+                "day_of_week": dow,  # 0=Mon, 6=Sun
                 "day_name": day_start.strftime("%A"),
                 "date": day_start.strftime("%Y-%m-%d"),
                 "mean_count": float(day_values.mean()),
                 "total_count": int(day_values.sum()),
+                "dow_sin": float(dow_sin),
+                "dow_cos": float(dow_cos),
                 "is_anomaly": False,  # Will be set during test evaluation if needed
             })
 
-        windows_array = np.array(windows)
+        windows_array = np.array(windows)  # Shape: (num_days, 24, 3)
         self.combo_windows[combo] = windows_array
         self.combo_window_info[combo] = window_info
 
@@ -316,13 +339,17 @@ class TransactionPreprocessor:
 
         IMPORTANT: Scaler is fit only on training data to prevent data leakage.
 
+        With DoW conditioning:
+        - Only channel 0 (transaction count) is normalized
+        - Channels 1-2 (DoW sin/cos) are left unchanged (already bounded [-1, 1])
+
         Args:
             combo: The (network_type, transaction_type) tuple
-            splits: Dict of data splits
+            splits: Dict of data splits, each with shape (num_days, 24, 3)
             fit_on: Which split to fit the scaler on (default: "train")
 
         Returns:
-            Dict with same keys, but normalized values
+            Dict with same keys, but with channel 0 normalized
         """
         if splits is None:
             splits = self.combo_splits.get(combo)
@@ -332,28 +359,45 @@ class TransactionPreprocessor:
         if fit_on not in splits or len(splits[fit_on]) == 0:
             raise ValueError(f"Cannot fit scaler: '{fit_on}' split is empty for {combo}")
 
-        # Fit scaler on training data only
-        train_flat = splits[fit_on].flatten().reshape(-1, 1)
+        # Fit scaler on channel 0 (transaction count) of training data only
+        train_data = splits[fit_on]
+        if train_data.ndim == 3:
+            # Shape: (num_days, 24, 3) - extract channel 0
+            train_counts = train_data[:, :, 0].flatten().reshape(-1, 1)
+        else:
+            # Legacy 2D shape: (num_days, 24)
+            train_counts = train_data.flatten().reshape(-1, 1)
 
         scaler = StandardScaler()
-        scaler.fit(train_flat)
+        scaler.fit(train_counts)
         self.scalers[combo] = scaler
 
         logger.debug(
-            f"  {combo}: Scaler mean={scaler.mean_[0]:.2f}, std={scaler.scale_[0]:.2f}"
+            f"  {combo}: Scaler (channel 0) mean={scaler.mean_[0]:.2f}, std={scaler.scale_[0]:.2f}"
         )
 
-        # Transform all splits
+        # Transform all splits - only normalize channel 0
         normalized_splits = {}
         for name, data in splits.items():
             if len(data) == 0:
                 normalized_splits[name] = data
                 continue
 
-            original_shape = data.shape
-            flat = data.flatten().reshape(-1, 1)
-            normalized = scaler.transform(flat)
-            normalized_splits[name] = normalized.reshape(original_shape)
+            if data.ndim == 3:
+                # Shape: (num_days, 24, 3)
+                normalized = data.copy()
+                # Normalize channel 0 only
+                counts = data[:, :, 0].flatten().reshape(-1, 1)
+                counts_norm = scaler.transform(counts)
+                normalized[:, :, 0] = counts_norm.reshape(data.shape[0], data.shape[1])
+                # Channels 1-2 (DoW sin/cos) are left unchanged
+                normalized_splits[name] = normalized
+            else:
+                # Legacy 2D shape: (num_days, 24)
+                original_shape = data.shape
+                flat = data.flatten().reshape(-1, 1)
+                normalized = scaler.transform(flat)
+                normalized_splits[name] = normalized.reshape(original_shape)
 
         return normalized_splits
 
@@ -474,26 +518,46 @@ class TransactionPreprocessor:
     def inverse_transform(
         self,
         combo: Tuple[str, str],
-        data: np.ndarray
+        data: np.ndarray,
+        channel_only: bool = True
     ) -> np.ndarray:
         """
         Inverse transform normalized data back to original scale.
 
+        With DoW conditioning, only channel 0 is inverse transformed.
+
         Args:
             combo: The (network_type, transaction_type) tuple
-            data: Normalized data array
+            data: Normalized data array, shape (num_days, 24, 3) or (num_days, 24)
+            channel_only: If True and data is 3D, return only channel 0 (counts)
 
         Returns:
-            Data in original scale
+            Data in original scale. If channel_only and 3D input, returns (num_days, 24).
+            Otherwise returns same shape as input with channel 0 inverse transformed.
         """
         if combo not in self.scalers:
             raise ValueError(f"Scaler not fitted for {combo}. Call normalize() first.")
 
         scaler = self.scalers[combo]
-        original_shape = data.shape
-        flat = data.flatten().reshape(-1, 1)
-        original = scaler.inverse_transform(flat)
-        return original.reshape(original_shape)
+
+        if data.ndim == 3:
+            # Shape: (num_days, 24, 3) - inverse transform channel 0 only
+            counts_norm = data[:, :, 0].flatten().reshape(-1, 1)
+            counts_orig = scaler.inverse_transform(counts_norm)
+            counts_orig = counts_orig.reshape(data.shape[0], data.shape[1])
+
+            if channel_only:
+                return counts_orig
+            else:
+                result = data.copy()
+                result[:, :, 0] = counts_orig
+                return result
+        else:
+            # Legacy 2D shape: (num_days, 24)
+            original_shape = data.shape
+            flat = data.flatten().reshape(-1, 1)
+            original = scaler.inverse_transform(flat)
+            return original.reshape(original_shape)
 
     def get_stats(self) -> Dict:
         """Get preprocessing statistics for all combos."""

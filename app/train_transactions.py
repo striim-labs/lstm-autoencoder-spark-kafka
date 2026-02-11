@@ -264,8 +264,8 @@ def main():
     parser.add_argument(
         "--hidden-dim",
         type=int,
-        default=32,
-        help="LSTM hidden dimension"
+        default=18,
+        help="LSTM hidden dimension (16 for DoW conditioning bottleneck)"
     )
     parser.add_argument(
         "--epochs",
