@@ -185,6 +185,89 @@ class SyntheticAnomalyGenerator:
 
         return corrupted
 
+    def inject_spike_at_hours(
+        self,
+        window: np.ndarray,
+        hour_start: int = 2,
+        hour_end: int = 5,
+        magnitude_sigma: float = 2.0
+    ) -> np.ndarray:
+        """
+        Inject a spike (increase) during specified hours.
+
+        Simulates an unexpected burst of activity during normally quiet hours.
+        For transaction data with hourly aggregation, indices correspond directly to hours.
+
+        Args:
+            window: Original window data, shape (seq_len,) or (seq_len, 1)
+            hour_start: Starting hour (0-23) for spike injection
+            hour_end: Ending hour (exclusive) for spike injection
+            magnitude_sigma: Magnitude of spike in standard deviation units
+
+        Returns:
+            Corrupted window with spike injection
+        """
+        was_2d = window.ndim == 2
+        if was_2d:
+            window = window.squeeze(-1)
+
+        corrupted = window.copy()
+        std = window.std()
+
+        # Clamp hour range to valid indices
+        hour_start = max(0, min(hour_start, len(window) - 1))
+        hour_end = max(hour_start + 1, min(hour_end, len(window)))
+
+        # Apply positive spike
+        corrupted[hour_start:hour_end] += magnitude_sigma * std
+
+        if was_2d:
+            corrupted = corrupted.reshape(-1, 1)
+
+        return corrupted
+
+    def inject_dip_at_hours(
+        self,
+        window: np.ndarray,
+        hour_start: int = 10,
+        hour_end: int = 14,
+        magnitude_sigma: float = 2.0
+    ) -> np.ndarray:
+        """
+        Inject a dip (decrease) during specified hours.
+
+        Simulates an outage or service disruption during normally busy hours.
+        For transaction data with hourly aggregation, indices correspond directly to hours.
+
+        Args:
+            window: Original window data, shape (seq_len,) or (seq_len, 1)
+            hour_start: Starting hour (0-23) for dip injection
+            hour_end: Ending hour (exclusive) for dip injection
+            magnitude_sigma: Magnitude of dip in standard deviation units
+
+        Returns:
+            Corrupted window with dip injection
+        """
+        was_2d = window.ndim == 2
+        if was_2d:
+            window = window.squeeze(-1)
+
+        corrupted = window.copy()
+        std = window.std()
+
+        # Clamp hour range to valid indices
+        hour_start = max(0, min(hour_start, len(window) - 1))
+        hour_end = max(hour_start + 1, min(hour_end, len(window)))
+
+        # Apply negative dip (but don't go below 0 for count data)
+        corrupted[hour_start:hour_end] -= magnitude_sigma * std
+        corrupted = np.maximum(corrupted, 0)  # Counts can't be negative
+
+        if was_2d:
+            corrupted = corrupted.reshape(-1, 1)
+
+        return corrupted
+
     def generate_synthetic_anomaly(
         self,
         week: np.ndarray,

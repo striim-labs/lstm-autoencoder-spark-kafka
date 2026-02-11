@@ -221,3 +221,8 @@ models/credit_card/**
 models/credit_card_fix1_2/**
 models/credit_card_fix1_2_4/**
 data/creditcard.csv
+data/synthetic_transactions.csv
+data/generate_transactions.py
+models/transactions/
+evaluation/fiserv
+additions.md
