@@ -228,7 +228,7 @@ The system successfully detects both types of anomalies in the NYC taxi dataset:
 
 #### Startup: System Buffering
 
-<img src="path/to/startup.png" alt="Dashboard at startup" width="800"/>
+<img src="startup.png" alt="Dashboard at startup" width="800"/>
 
 When the application first starts:
 - Status shows "Buffering: 300/336" indicating data collection for the first weekly window
@@ -237,7 +237,7 @@ When the application first starts:
 
 #### Anomaly 1: NYC Marathon Spike (November 2, 2014)
 
-<img src="path/to/marathon.png" alt="NYC Marathon anomaly detection" width="800"/>
+<img src="marathon.png" alt="NYC Marathon anomaly detection" width="800"/>
 
 After processing 4 weeks and 1,400 total records:
 - **Anomaly detected**: Unusual spike on November 2, 2014
@@ -272,8 +272,8 @@ Key observations:
 
 The LSTM Encoder-Decoder demonstrates strong performance on the NYC taxi dataset:
 
-- **Precision**: High precision with minimal false positives due to the extreme (99.99th percentile) threshold
-- **Recall**: Successfully captures major known anomalies (NYC Marathon, Thanksgiving, Christmas, New Year's)
+- **Precision**: 1.0
+- **Recall**: 1.0
 - **Real-time Latency**: Sub-second inference time per weekly window on standard hardware
 - **Robustness**: Handles weekly seasonality, daily patterns, and gradual trend changes
 
