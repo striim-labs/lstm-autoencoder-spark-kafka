@@ -34,6 +34,14 @@ class ScorerConfig:
     # Point-level scoring parameters (Malhotra et al. 2016)
     scoring_mode: str = "point"           # "point" (paper) or "window" (legacy)
     hard_criterion_k: int = 5             # Points exceeding threshold to flag window as anomalous
+    # Channel selection for multivariate input (e.g., DoW conditioning)
+    # -1 = use all channels (multivariate Mahalanobis)
+    # 0 = use only channel 0 (transaction count, univariate scoring)
+    score_channel: int = 0
+    # Minimum variance floor to prevent extreme score amplification
+    # When training errors are very small (σ ≈ 0.0006), the score formula
+    # (error - μ)² / σ can amplify by ~1500x. This floor prevents that.
+    min_variance_floor: float = 0.01
 
 
 class AnomalyScorer:
@@ -81,7 +89,8 @@ class AnomalyScorer:
         self,
         model: torch.nn.Module,
         train_loader: DataLoader,
-        device: torch.device
+        device: torch.device,
+        val_loader: Optional[DataLoader] = None
     ) -> None:
         """
         Fit the error distribution on training (normal) data.
@@ -91,10 +100,15 @@ class AnomalyScorer:
           compute μ and σ across features (scalar for univariate)
         - "window" (legacy): Compute μ and Σ across time axis
 
+        When val_loader is provided, μ and σ are computed from validation
+        data instead of training data. This prevents score amplification
+        from overly tight training error distributions.
+
         Args:
             model: Trained LSTM encoder-decoder model
             train_loader: DataLoader with normal training sequences
             device: Device to run inference on (cpu/cuda)
+            val_loader: Optional DataLoader for computing μ and σ from validation data
         """
         model.eval()
         all_errors = []
@@ -124,14 +138,65 @@ class AnomalyScorer:
             self.mu_point = np.mean(all_errors_pooled, axis=0)
 
             if num_features == 1:
-                # Univariate case: compute scalar variance
-                self.sigma_point = np.var(all_errors_pooled, axis=0) + self.config.regularization
+                # Univariate case: compute BOTH μ and σ from validation data if available
+                if val_loader is not None:
+                    val_errors = self._compute_errors(model, val_loader, device)
+                    val_errors_flat = val_errors.flatten()
+                    self.mu_point = np.array([np.mean(val_errors_flat)])
+                    computed_var = np.var(val_errors_flat)
+                    logger.info(f"  Using validation data for μ and σ")
+                else:
+                    self.mu_point = np.mean(all_errors_pooled, axis=0)
+                    computed_var = np.var(all_errors_pooled, axis=0)[0]
+                    logger.info(f"  Using training data for μ and σ (no val_loader)")
+
+                # Apply variance floor to prevent extreme amplification
+                floored_var = max(computed_var, self.config.min_variance_floor)
+                self.sigma_point = np.array([floored_var + self.config.regularization])
                 self.sigma_inv_point = 1.0 / self.sigma_point
+
                 logger.info(f"Fitted point-level scorer (univariate):")
                 logger.info(f"  mu_point: {self.mu_point[0]:.6f}")
-                logger.info(f"  sigma_point: {self.sigma_point[0]:.6f}")
+                logger.info(f"  sigma_point: {self.sigma_point[0]:.6f} (raw variance: {computed_var:.6f}, floor: {self.config.min_variance_floor})")
+
+            elif self.config.score_channel >= 0:
+                # Channel-specific scoring: extract single channel for univariate scoring
+                # This is useful for DoW conditioning where channels 1-2 have near-zero error
+                ch = self.config.score_channel
+
+                # Compute BOTH μ and σ from validation data if available
+                if val_loader is not None:
+                    val_errors = self._compute_errors(model, val_loader, device)
+                    if val_errors.ndim == 3 and val_errors.shape[2] > ch:
+                        val_errors_ch = val_errors[:, :, ch].flatten()
+                    else:
+                        val_errors_ch = val_errors.flatten()
+
+                    self.mu_point = np.array([np.mean(val_errors_ch)])
+                    computed_var = np.var(val_errors_ch)
+                    logger.info(f"  Using validation data for μ and σ")
+                else:
+                    # Fallback to training data
+                    all_errors_ch = all_errors[:, :, ch]  # (N, seq_len)
+                    all_errors_ch_pooled = all_errors_ch.flatten()  # (N * seq_len,)
+                    self.mu_point = np.array([np.mean(all_errors_ch_pooled)])
+                    computed_var = np.var(all_errors_ch_pooled)
+                    logger.info(f"  Using training data for μ and σ (no val_loader)")
+
+                # Apply variance floor to prevent extreme amplification
+                floored_var = max(computed_var, self.config.min_variance_floor)
+                self.sigma_point = np.array([floored_var + self.config.regularization])
+                self.sigma_inv_point = 1.0 / self.sigma_point
+
+                # Multivariate params not needed
+                self.cov_point = None
+                self.cov_inv_point = None
+
+                logger.info(f"Fitted point-level scorer (channel {ch} only):")
+                logger.info(f"  mu_point: {self.mu_point[0]:.6f}")
+                logger.info(f"  sigma_point: {self.sigma_point[0]:.6f} (raw variance: {computed_var:.6f}, floor: {self.config.min_variance_floor})")
             else:
-                # Multivariate case: compute full covariance
+                # Multivariate case: compute full covariance (score_channel=-1)
                 errors_centered = all_errors_pooled - self.mu_point
                 self.cov_point = np.cov(errors_centered, rowvar=False)
                 self.cov_point += self.config.regularization * np.eye(num_features)
@@ -179,6 +244,35 @@ class AnomalyScorer:
 
         self.is_fitted = True
         logger.info(f"Fitted on {num_sequences} sequences of length {seq_len}")
+
+    def _compute_errors(
+        self,
+        model: torch.nn.Module,
+        data_loader: DataLoader,
+        device: torch.device
+    ) -> np.ndarray:
+        """
+        Compute reconstruction errors for a DataLoader.
+
+        Args:
+            model: Trained LSTM encoder-decoder model
+            data_loader: DataLoader with sequences
+            device: Device to run inference on
+
+        Returns:
+            Reconstruction errors, shape (num_sequences, seq_len, num_features)
+        """
+        model.eval()
+        all_errors = []
+
+        with torch.no_grad():
+            for batch in data_loader:
+                x = batch.to(device)
+                x_reconstructed = model(x)
+                errors = torch.abs(x - x_reconstructed).cpu().numpy()
+                all_errors.append(errors)
+
+        return np.concatenate(all_errors, axis=0)
 
     def _mahalanobis_distance(self, error: np.ndarray) -> float:
         """
@@ -294,8 +388,14 @@ class AnomalyScorer:
                     # Univariate: (e - μ)² / σ²
                     errors_squeezed = errors.squeeze(-1)  # (batch, seq_len)
                     point_scores = ((errors_squeezed - self.mu_point[0]) ** 2) / self.sigma_point[0]
+                elif self.config.score_channel >= 0:
+                    # Channel-specific scoring: use only selected channel (univariate)
+                    # This avoids dilution from near-zero DoW reconstruction errors
+                    ch = self.config.score_channel
+                    errors_ch = errors[:, :, ch]  # (batch, seq_len)
+                    point_scores = ((errors_ch - self.mu_point[0]) ** 2) / self.sigma_point[0]
                 else:
-                    # Multivariate: full Mahalanobis
+                    # Multivariate: full Mahalanobis (score_channel=-1)
                     diff = errors - self.mu_point  # (batch, seq_len, m)
                     # Compute (diff @ cov_inv @ diff) for each point
                     point_scores = np.einsum('ijk,kl,ijl->ij', diff, self.cov_inv_point, diff)
@@ -775,6 +875,7 @@ class AnomalyScorer:
                 "threshold_percentile": self.config.threshold_percentile,
                 "threshold_sigma": self.config.threshold_sigma,
                 "hard_criterion_k": self.config.hard_criterion_k,
+                "score_channel": self.config.score_channel,
             }
         }
 

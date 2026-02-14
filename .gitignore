@@ -228,3 +228,14 @@ models/transactions/
 evaluation/fiserv
 additions.md
 changes.md
+FCVAE/
+fcvae_issues.md
+models/credit_card
+models/credit_card_fix1_2
+models/credit_card_fix1_2_4
+models/transactions_fcvae
+models/transactions_fcvae_60
+FCVAE/
+plots/
+data/synthetic_transactions_v2_with_anomalies.csv
+data/synthetic_transactions_v2_split60.csv

@@ -264,7 +264,7 @@ def main():
     parser.add_argument(
         "--hidden-dim",
         type=int,
-        default=18,
+        default=32,
         help="LSTM hidden dimension (16 for DoW conditioning bottleneck)"
     )
     parser.add_argument(
@@ -318,6 +318,18 @@ def main():
         type=float,
         default=2.0,
         help="Magnitude of synthetic anomalies in std units for calibration"
+    )
+    parser.add_argument(
+        "--score-channel",
+        type=int,
+        default=0,
+        help="Channel to use for anomaly scoring (0=transaction count, -1=all channels)"
+    )
+    parser.add_argument(
+        "--min-variance-floor",
+        type=float,
+        default=0.01,
+        help="Minimum variance floor to prevent extreme score amplification (default: 0.01)"
     )
     args = parser.parse_args()
 
@@ -374,6 +386,8 @@ def main():
         scoring_mode="point",
         threshold_percentile=args.threshold_percentile,
         hard_criterion_k=args.hard_criterion_k,
+        score_channel=args.score_channel,
+        min_variance_floor=args.min_variance_floor,
     )
     registry = ModelRegistry(
         model_config=model_config,
@@ -396,6 +410,12 @@ def main():
         print("  Threshold method: F1-max")
     else:
         print("\nUsing simple percentile-based threshold")
+
+    # Print scoring channel info
+    if args.score_channel >= 0:
+        print(f"\nScoring on channel {args.score_channel} only (transaction count)")
+    else:
+        print("\nScoring on all channels (multivariate Mahalanobis)")
 
     calibration_results = train_all_combos(
         registry=registry,

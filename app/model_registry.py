@@ -325,7 +325,8 @@ class ModelRegistry:
         scorer = self.get_scorer(combo)
 
         # Fit error distribution on validation data
-        scorer.fit(model, val_loader, self.device)
+        # Pass val_loader for both fitting and μ/σ computation to prevent overfitting
+        scorer.fit(model, val_loader, self.device, val_loader=val_loader)
 
         # Set threshold using threshold_val or val data
         data_loader = threshold_loader or val_loader
@@ -382,7 +383,8 @@ class ModelRegistry:
         scorer = self.get_scorer(combo)
 
         # Step 1: Fit error distribution on validation data (normal only)
-        scorer.fit(model, val_loader, self.device)
+        # Pass val_loader for both fitting and μ/σ computation to prevent overfitting
+        scorer.fit(model, val_loader, self.device, val_loader=val_loader)
         if scorer.sigma_point is not None:
             logger.info(f"  {combo}: Error distribution fitted (μ={scorer.mu_point[0]:.4f}, σ²={scorer.sigma_point[0]:.4f})")
         else:

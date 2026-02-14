@@ -139,8 +139,21 @@ def create_detector(
             min_samples=kwargs.get("min_samples", 336),
         )
 
+    elif detector_type == "fcvae":
+        from fcvae_streaming_detector import FCVAEStreamingDetector
+
+        return FCVAEStreamingDetector(
+            model_path=kwargs.get("model_path", "models/transactions_fcvae"),
+            scaler_path=kwargs.get("scaler_path"),
+            scorer_path=kwargs.get("scorer_path"),
+            combo=kwargs.get("combo"),
+            window_size=kwargs.get("window_size", 24),
+            min_samples=kwargs.get("min_samples", 24),
+            n_samples=kwargs.get("n_samples", 16),
+        )
+
     else:
         raise ValueError(
             f"Unknown detector type: {detector_type}. "
-            f"Must be one of: 'isolation_forest', 'lstm'"
+            f"Must be one of: 'isolation_forest', 'lstm', 'fcvae'"
         )

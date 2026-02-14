@@ -63,6 +63,40 @@ class TimeSeriesDataset(Dataset):
         return self.sequences[idx]
 
 
+class SlidingWindowDataset(Dataset):
+    """
+    PyTorch Dataset for FCVAE sliding windows.
+
+    Each sample is a sliding window of hourly transaction counts,
+    shaped as (1, window_size) for FCVAE input.
+
+    Unlike TimeSeriesDataset, this does NOT include DoW features
+    (FCVAE uses frequency conditioning instead).
+    """
+
+    def __init__(self, windows: np.ndarray, labels: np.ndarray):
+        """
+        Args:
+            windows: Array of shape (num_windows, window_size)
+            labels: Array of shape (num_windows, window_size) - anomaly labels
+        """
+        # FCVAE expects (B, 1, W) shape
+        self.windows = torch.FloatTensor(windows).unsqueeze(1)  # (N, 1, W)
+        self.labels = torch.FloatTensor(labels)  # (N, W)
+        # Missing mask (all zeros for normal data)
+        self.missing = torch.zeros_like(self.labels)
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            Tuple of (window, labels, missing_mask) matching FCVAE dataset format
+        """
+        return self.windows[idx], self.labels[idx], self.missing[idx]
+
+
 class TransactionPreprocessor:
     """
     Preprocessor for synthetic transaction data.
@@ -94,6 +128,11 @@ class TransactionPreprocessor:
         self.raw_df: Optional[pd.DataFrame] = None
         self.data_start: Optional[pd.Timestamp] = None
         self.data_end: Optional[pd.Timestamp] = None
+
+        # Split info from CSV (if available)
+        self.has_csv_splits: bool = False
+        self.combo_hour_splits: Dict[Tuple[str, str], pd.Series] = {}
+        self.combo_hour_anomalies: Dict[Tuple[str, str], pd.Series] = {}
 
         logger.info(f"Initialized TransactionPreprocessor with config: {self.config}")
 
@@ -130,10 +169,34 @@ class TransactionPreprocessor:
         # Bin timestamps to hour
         df["hour_bucket"] = df["timestamp"].dt.floor("h")
 
+        # Ensure is_anomaly column exists
+        if "is_anomaly" not in df.columns:
+            df["is_anomaly"] = 0
+
+        # Check for split column (from 60-day dataset)
+        has_split_col = "split" in df.columns
+        if has_split_col and self.config.use_csv_splits:
+            self.has_csv_splits = True
+            logger.info("Found 'split' column in CSV - using CSV-based splits")
+        else:
+            self.has_csv_splits = False
+            logger.info("No 'split' column - using day-based splits")
+
         # Aggregate: count transactions per hour per combo
+        # Also aggregate is_anomaly (max = 1 if any transaction was anomalous)
+        # And split (first = all transactions in an hour should have same split)
+        agg_dict = {"timestamp": "count", "is_anomaly": "max"}
+        if has_split_col:
+            agg_dict["split"] = "first"
+
         counts = df.groupby(
             ["hour_bucket", "network_type", "transaction_type"]
-        ).size().reset_index(name="count")
+        ).agg(agg_dict).reset_index()
+
+        if has_split_col:
+            counts.columns = ["hour_bucket", "network_type", "transaction_type", "count", "is_anomaly", "split"]
+        else:
+            counts.columns = ["hour_bucket", "network_type", "transaction_type", "count", "is_anomaly"]
 
         # Create complete hourly index for the full date range
         full_hours = pd.date_range(
@@ -149,26 +212,45 @@ class TransactionPreprocessor:
             network_type, transaction_type = combo
 
             # Filter to this combo
+            cols_to_keep = ["hour_bucket", "count", "is_anomaly"]
+            if has_split_col:
+                cols_to_keep.append("split")
+
             combo_counts = counts[
                 (counts["network_type"] == network_type) &
                 (counts["transaction_type"] == transaction_type)
-            ][["hour_bucket", "count"]].copy()
+            ][cols_to_keep].copy()
 
             # Reindex to full hour range, fill missing with 0
             combo_df = pd.DataFrame({"hour_bucket": full_hours})
             combo_df = combo_df.merge(combo_counts, on="hour_bucket", how="left")
             combo_df["count"] = combo_df["count"].fillna(0).astype(int)
+            combo_df["is_anomaly"] = combo_df["is_anomaly"].fillna(0).astype(int)
+
+            # Handle split column
+            if has_split_col:
+                # Forward-fill then backward-fill to handle any gaps
+                combo_df["split"] = combo_df["split"].ffill().bfill()
+                self.combo_hour_splits[combo] = combo_df["split"]
+                self.combo_hour_anomalies[combo] = combo_df["is_anomaly"]
 
             self.combo_hourly[combo] = combo_df
 
             # Log stats
             total_txns = combo_df["count"].sum()
             mean_hourly = combo_df["count"].mean()
-            logger.info(
+            anomaly_hours = combo_df["is_anomaly"].sum()
+            log_msg = (
                 f"  {combo}: {len(combo_df)} hours, "
                 f"{total_txns:,} total transactions, "
                 f"{mean_hourly:.1f} mean/hour"
             )
+            if anomaly_hours > 0:
+                log_msg += f", {anomaly_hours} anomaly hours"
+            if has_split_col:
+                split_counts = combo_df["split"].value_counts().to_dict()
+                log_msg += f", splits: {split_counts}"
+            logger.info(log_msg)
 
         return self.combo_hourly
 
@@ -254,6 +336,275 @@ class TransactionPreprocessor:
         )
 
         return windows_array, window_info
+
+    def create_sliding_windows(
+        self,
+        combo: Tuple[str, str],
+        window_size: int = 24,
+        stride: int = 1,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Create overlapping sliding windows from hourly count series for FCVAE.
+
+        Unlike segment_into_days() which creates non-overlapping daily windows with
+        DoW features, this creates overlapping sliding windows without DoW features
+        (FCVAE uses frequency conditioning instead).
+
+        Args:
+            combo: (network_type, transaction_type) tuple
+            window_size: Window size in hours (default 24)
+            stride: Step size between windows (default 1 hour for maximum samples)
+
+        Returns:
+            Tuple of:
+                - values: (num_windows, window_size) hourly counts (float32)
+                - labels: (num_windows, window_size) binary anomaly labels
+                - timestamps: (num_windows,) starting hour index for each window
+        """
+        hourly_df = self.combo_hourly.get(combo)
+        if hourly_df is None:
+            raise ValueError(f"No hourly data for combo {combo}. Call load_and_aggregate() first.")
+
+        values = hourly_df["count"].values.astype(np.float32)
+        anomalies = hourly_df["is_anomaly"].values.astype(np.float32)
+        total_hours = len(values)
+
+        # Calculate number of windows
+        num_windows = (total_hours - window_size) // stride + 1
+
+        if num_windows <= 0:
+            logger.warning(f"  {combo}: Not enough data for sliding windows "
+                          f"(need {window_size} hours, have {total_hours})")
+            return np.array([]), np.array([]), np.array([])
+
+        # Create windows
+        windows = np.zeros((num_windows, window_size), dtype=np.float32)
+        labels = np.zeros((num_windows, window_size), dtype=np.float32)
+        timestamps = np.zeros(num_windows, dtype=np.int32)
+
+        for i in range(num_windows):
+            start_idx = i * stride
+            end_idx = start_idx + window_size
+            windows[i] = values[start_idx:end_idx]
+            labels[i] = anomalies[start_idx:end_idx]  # Use actual anomaly labels
+            timestamps[i] = start_idx
+
+        # Store for later use
+        if not hasattr(self, "combo_sliding_windows"):
+            self.combo_sliding_windows = {}
+        self.combo_sliding_windows[combo] = {
+            "windows": windows,
+            "labels": labels,
+            "timestamps": timestamps,
+            "window_size": window_size,
+            "stride": stride,
+        }
+
+        anomaly_windows = (labels.sum(axis=1) > 0).sum()
+        logger.debug(
+            f"  {combo}: Created {num_windows} sliding windows "
+            f"(W={window_size}, stride={stride}, {anomaly_windows} with anomalies)"
+        )
+
+        return windows, labels, timestamps
+
+    def create_sliding_splits(
+        self,
+        combo: Tuple[str, str],
+        window_size: int = 24,
+        stride: int = 1,
+    ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Create train/val/test splits for sliding windows.
+
+        If CSV has 'split' column, uses that directly. Otherwise falls back to
+        day-based splits:
+        - Train: Windows starting in days 0-17
+        - Val: Windows starting in days 18-21
+        - Threshold: Windows starting in days 22-24
+        - Test: Windows starting in days 25+
+
+        Args:
+            combo: (network_type, transaction_type) tuple
+            window_size: Window size in hours (default 24)
+            stride: Step size between windows (default 1 hour)
+
+        Returns:
+            Dict with keys: train, val, threshold_val, test
+            Each value is tuple of (windows, labels) where:
+                - windows: (num_windows, window_size) array
+                - labels: (num_windows, window_size) array
+        """
+        # Create sliding windows if not already done
+        if not hasattr(self, "combo_sliding_windows") or combo not in self.combo_sliding_windows:
+            self.create_sliding_windows(combo, window_size, stride)
+
+        sw_data = self.combo_sliding_windows[combo]
+        windows = sw_data["windows"]
+        labels = sw_data["labels"]
+        timestamps = sw_data["timestamps"]
+
+        if len(windows) == 0:
+            empty = (np.array([]), np.array([]))
+            return {"train": empty, "val": empty, "threshold_val": empty, "test": empty}
+
+        # Use CSV-based splits if available
+        if self.has_csv_splits and combo in self.combo_hour_splits:
+            hourly_splits = self.combo_hour_splits[combo].values
+            hourly_anomalies = self.combo_hour_anomalies[combo].values
+
+            # Assign windows based on the split of their starting hour
+            window_splits = np.array([hourly_splits[ts] for ts in timestamps])
+
+            train_mask = window_splits == "train"
+            val_mask = window_splits == "val"
+            test_mask = window_splits == "test"
+
+            # For CSV-based splits, val doubles as threshold_val (no separate threshold period)
+            splits = {
+                "train": (windows[train_mask], labels[train_mask]),
+                "val": (windows[val_mask], labels[val_mask]),
+                "threshold_val": (windows[val_mask], labels[val_mask]),  # Same as val
+                "test": (windows[test_mask], labels[test_mask]),
+            }
+
+            # Log anomaly counts
+            val_anomaly_windows = (labels[val_mask].sum(axis=1) > 0).sum() if val_mask.sum() > 0 else 0
+            test_anomaly_windows = (labels[test_mask].sum(axis=1) > 0).sum() if test_mask.sum() > 0 else 0
+
+            logger.info(
+                f"  {combo}: CSV-based splits - "
+                f"train={train_mask.sum()}, "
+                f"val={val_mask.sum()} ({val_anomaly_windows} anomaly windows), "
+                f"test={test_mask.sum()} ({test_anomaly_windows} anomaly windows)"
+            )
+        else:
+            # Fall back to day-based splits
+            hours_per_day = SAMPLES_PER_DAY
+            train_end_hour = self.config.train_days * hours_per_day
+            val_end_hour = (self.config.train_days + self.config.val_days) * hours_per_day
+            threshold_end_hour = (self.config.train_days + self.config.val_days +
+                                  self.config.threshold_days) * hours_per_day
+
+            # Assign windows to splits based on starting timestamp
+            train_mask = timestamps < train_end_hour
+            val_mask = (timestamps >= train_end_hour) & (timestamps < val_end_hour)
+            threshold_mask = (timestamps >= val_end_hour) & (timestamps < threshold_end_hour)
+            test_mask = timestamps >= threshold_end_hour
+
+            splits = {
+                "train": (windows[train_mask], labels[train_mask]),
+                "val": (windows[val_mask], labels[val_mask]),
+                "threshold_val": (windows[threshold_mask], labels[threshold_mask]),
+                "test": (windows[test_mask], labels[test_mask]),
+            }
+
+            logger.debug(
+                f"  {combo}: Day-based splits - "
+                f"train={len(splits['train'][0])}, "
+                f"val={len(splits['val'][0])}, "
+                f"threshold={len(splits['threshold_val'][0])}, "
+                f"test={len(splits['test'][0])}"
+            )
+
+        # Store split info
+        if not hasattr(self, "combo_sliding_split_counts"):
+            self.combo_sliding_split_counts = {}
+        self.combo_sliding_split_counts[combo] = {
+            name: len(data[0]) for name, data in splits.items()
+        }
+
+        return splits
+
+    def normalize_sliding_windows(
+        self,
+        combo: Tuple[str, str],
+        splits: Dict[str, Tuple[np.ndarray, np.ndarray]],
+        fit_on: str = "train"
+    ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Normalize sliding windows using StandardScaler.
+
+        Creates a separate scaler for FCVAE sliding windows (stored with '_sliding' suffix).
+
+        Args:
+            combo: (network_type, transaction_type) tuple
+            splits: Dict from create_sliding_splits()
+            fit_on: Which split to fit the scaler on (default: "train")
+
+        Returns:
+            Dict with same structure, but with normalized window values
+        """
+        if fit_on not in splits or len(splits[fit_on][0]) == 0:
+            raise ValueError(f"Cannot fit scaler: '{fit_on}' split is empty for {combo}")
+
+        train_windows = splits[fit_on][0]
+        train_flat = train_windows.flatten().reshape(-1, 1)
+
+        scaler = StandardScaler()
+        scaler.fit(train_flat)
+
+        # Store with suffix to distinguish from daily window scaler
+        scaler_key = (combo[0], combo[1] + "_sliding")
+        self.scalers[scaler_key] = scaler
+
+        logger.debug(
+            f"  {combo}: Sliding scaler mean={scaler.mean_[0]:.2f}, std={scaler.scale_[0]:.2f}"
+        )
+
+        # Transform all splits
+        normalized_splits = {}
+        for name, (windows, labels) in splits.items():
+            if len(windows) == 0:
+                normalized_splits[name] = (windows, labels)
+                continue
+
+            flat = windows.flatten().reshape(-1, 1)
+            normalized = scaler.transform(flat)
+            normalized_splits[name] = (
+                normalized.reshape(windows.shape),
+                labels
+            )
+
+        return normalized_splits
+
+    def create_sliding_dataloaders(
+        self,
+        normalized_splits: Dict[str, Tuple[np.ndarray, np.ndarray]],
+        batch_size: int = 64,
+        shuffle_train: bool = True
+    ) -> Dict[str, Optional[DataLoader]]:
+        """
+        Create PyTorch DataLoaders for FCVAE sliding windows.
+
+        Args:
+            normalized_splits: Dict from normalize_sliding_windows()
+            batch_size: Batch size (larger than daily windows due to more samples)
+            shuffle_train: Whether to shuffle training data (default True for FCVAE)
+
+        Returns:
+            Dict with DataLoader for each split (None for empty splits)
+        """
+        dataloaders = {}
+
+        for name, (windows, labels) in normalized_splits.items():
+            if len(windows) == 0:
+                dataloaders[name] = None
+                continue
+
+            # Create dataset for FCVAE: (B, 1, W) format
+            dataset = SlidingWindowDataset(windows, labels)
+
+            loader = DataLoader(
+                dataset,
+                batch_size=min(batch_size, len(windows)),
+                shuffle=(shuffle_train and name == "train"),
+                drop_last=False,
+            )
+
+            dataloaders[name] = loader
+
+        return dataloaders
 
     def create_splits(
         self,
