@@ -45,38 +45,30 @@ Real-time anomaly detection on NYC taxi demand data using Kafka streaming, Spark
 
 ## Quick Start (Docker)
 
-### 1. Clone the Repository and Install dependencies locally
-
 ```bash
+# Install uv (Python package manager) if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the repository and install dependencies
 git clone https://github.com/your-username/lstm-autoencoder-spark-kafka.git
 cd lstm-autoencoder-spark-kafka
 uv sync
+
+# Build and run all services with Docker Compose
+MESSAGE_DELAY_SECONDS=0.005 DETECTOR_TYPE=lstm START_OFFSET=4944 LOOP_DATA=false docker compose up --build
+
+# Open the dashboard
+open http://localhost:8050
 ```
 
-### 2. Download the Dataset
+### Dataset
 
-The NYC taxi dataset should be placed in `data/nyc_taxi.csv`. If not present, download it:
+> **Note:** The dataset is already included in the repository at `data/nyc_taxi.csv`. **Do not run the command below** — it is only here to document how the data was originally acquired.
 
 ```bash
 # The dataset is from the Numenta Anomaly Benchmark (NAB)
 curl -o data/nyc_taxi.csv https://raw.githubusercontent.com/numenta/NAB/master/data/realKnownCause/nyc_taxi.csv
 ```
-
-### 3. Build and Run with Docker Compose
-
-**For LSTM detection mode:**
-```bash
-MESSAGE_DELAY_SECONDS=0.005 DETECTOR_TYPE=lstm START_OFFSET=4944 LOOP_DATA=false docker compose up --build
-```
-
-**For Isolation Forest detection mode:**
-```bash
-DETECTOR_TYPE=isolation_forest docker compose up --build
-```
-
-### 4. View the Dashboard
-
-Open your browser to: **http://localhost:8050**
 
 
 ### View Logs
@@ -150,6 +142,8 @@ Based on [Malhotra et al. (2016)](https://arxiv.org/abs/1607.00148):
 
 #### Model Training Workflow
 
+> **Note:** The pre-trained model is already included in `models/`. **Do not run any of the commands below** — this section documents the workflow used to create the model, not steps you need to execute.
+
 The pre-trained model in `models/` was created through the following optimization process:
 
 **1. Data Split Optimization**
@@ -208,13 +202,6 @@ The `evaluation/` directory contains performance visualizations:
 - `weekly_comparison.png` - Normal vs anomaly week reconstruction comparison
 - `reconstruction_*.png` - Detailed reconstruction plots for each anomaly week
 
-
-### Isolation Forest
-
-- **Architecture**: Ensemble of isolation trees
-- **Scoring**: Path length-based anomaly score
-- **Windows**: Sliding window analysis
-- **Threshold**: Configurable contamination parameter
 
 ## Real-Time Dashboard
 
