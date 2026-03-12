@@ -55,7 +55,7 @@ cd lstm-autoencoder-spark-kafka
 uv sync
 
 # Build and run all services with Docker Compose
-MESSAGE_DELAY_SECONDS=0.005 DETECTOR_TYPE=lstm START_OFFSET=4944 LOOP_DATA=false docker compose up --build
+MESSAGE_DELAY_SECONDS=0.005 DETECTOR_TYPE=lstm START_OFFSET=4944 LOOP_DATA=false docker compose up --build -d
 
 # Open the dashboard
 open http://localhost:8050
