@@ -20,19 +20,12 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
 # Copy pyproject.toml and install dependencies
-COPY pyproject.toml .
+COPY app/pyproject.toml .
 RUN uv pip install --system -r pyproject.toml
 
-# Copy all application code
-COPY main.py .
-COPY base_detector.py .
-COPY isolation_forest_detector.py .
-COPY streaming_detector.py .
-COPY lstm_autoencoder.py .
-COPY anomaly_scorer.py .
-COPY data_preprocessor.py .
-COPY train.py .
-COPY evaluate.py .
+# Copy application code
+COPY code/6_streaming_app.py ./main.py
+COPY src/ ./src/
 
 # Create models directory (will be mounted as volume)
 RUN mkdir -p models
@@ -41,10 +34,6 @@ RUN mkdir -p models
 EXPOSE 8050
 
 # Default environment variables
-ENV DETECTOR_TYPE=isolation_forest
-ENV WINDOW_SIZE=200
-ENV MIN_SAMPLES=50
-ENV CONTAMINATION=0.05
 ENV MODEL_PATH=models/lstm_model.pt
 ENV SCALER_PATH=models/scaler.pkl
 ENV SCORER_PATH=models/scorer.pkl

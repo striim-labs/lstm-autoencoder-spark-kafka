@@ -115,11 +115,11 @@ services:
   # ============================================
   # APP - Dash visualization + anomaly detection
   # ============================================
-  # Supports two detector types via DETECTOR_TYPE env var:
-  #   - isolation_forest (default): Real-time sliding window detection
-  #   - lstm: LSTM Encoder-Decoder with pre-trained model
+  # LSTM Encoder-Decoder with pre-trained model
   app:
-    build: ./app
+    build:
+      context: .
+      dockerfile: Dockerfile.app
     container_name: app
     depends_on:
       - kafka
@@ -130,11 +130,6 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: anomaly_stream
       SPARK_MASTER: spark://spark-master:7077
-      # Detector configuration
-      DETECTOR_TYPE: ${DETECTOR_TYPE:-isolation_forest}
-      WINDOW_SIZE: ${WINDOW_SIZE:-200}
-      MIN_SAMPLES: ${MIN_SAMPLES:-50}
-      CONTAMINATION: ${CONTAMINATION:-0.05}
       # LSTM model paths (relative to /app in container)
       MODEL_PATH: models/lstm_model.pt
       SCALER_PATH: models/scaler.pkl

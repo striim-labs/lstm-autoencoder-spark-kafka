@@ -2,13 +2,10 @@
 Anomaly Scorer for LSTM Encoder-Decoder
 
 Implements the scoring methodology from Malhotra et al. (2016):
-1. Fit error distribution (μ, Σ) on normal training data
+1. Fit error distribution (mu, Sigma) on normal training data
 2. Compute Mahalanobis distance as anomaly score
 3. Set threshold using validation data
 4. Predict anomalies based on threshold
-
-Uses the full covariance matrix to capture dependencies
-between reconstruction errors at different timesteps.
 """
 
 import logging
@@ -31,9 +28,8 @@ class ScorerConfig:
     threshold_percentile: float = 95.0    # For percentile method
     threshold_sigma: float = 3.0          # For sigma method (k * std)
     regularization: float = 1e-6          # Regularization for covariance inversion
-    # Point-level scoring parameters (Malhotra et al. 2016)
     scoring_mode: str = "point"           # "point" (paper) or "window" (legacy)
-    hard_criterion_k: int = 5             # Points exceeding threshold to flag window as anomalous
+    hard_criterion_k: int = 5             # Points exceeding threshold to flag window
 
 
 class AnomalyScorer:
@@ -42,21 +38,10 @@ class AnomalyScorer:
 
     The scorer learns the distribution of reconstruction errors on
     normal (training) data, fitting a multivariate Gaussian with
-    mean μ and covariance Σ.
+    mean mu and covariance Sigma.
 
-    Anomaly Score (Mahalanobis distance):
-        a(i) = (e(i) - μ)ᵀ Σ⁻¹ (e(i) - μ)
-
-    Where:
-        - e(i) is the reconstruction error vector for sequence i
-        - μ is the mean error vector (learned from training)
-        - Σ is the covariance matrix of errors (learned from training)
-
-    Attributes:
-        mu: Mean reconstruction error vector, shape (seq_len,)
-        cov: Covariance matrix of errors, shape (seq_len, seq_len)
-        cov_inv: Inverse covariance matrix (precision matrix)
-        threshold: Anomaly score threshold for classification
+    Anomaly Score:
+        a(i) = (e(i) - mu)^T Sigma^-1 (e(i) - mu)
     """
 
     def __init__(self, config: Optional[ScorerConfig] = None):
@@ -67,12 +52,12 @@ class AnomalyScorer:
         self.cov_inv: Optional[np.ndarray] = None
         self.threshold: Optional[float] = None
         # Point-level attributes (Malhotra et al. 2016)
-        self.mu_point: Optional[np.ndarray] = None      # Mean error across all points, shape (m,)
-        self.sigma_point: Optional[np.ndarray] = None   # Variance (for univariate), shape (m,)
-        self.sigma_inv_point: Optional[np.ndarray] = None  # Inverse variance
-        self.cov_point: Optional[np.ndarray] = None     # Covariance across features (multivariate)
-        self.cov_inv_point: Optional[np.ndarray] = None # Inverse covariance
-        self.point_threshold: Optional[float] = None    # Per-point threshold τ
+        self.mu_point: Optional[np.ndarray] = None
+        self.sigma_point: Optional[np.ndarray] = None
+        self.sigma_inv_point: Optional[np.ndarray] = None
+        self.cov_point: Optional[np.ndarray] = None
+        self.cov_inv_point: Optional[np.ndarray] = None
+        self.point_threshold: Optional[float] = None
         self.is_fitted: bool = False
 
         logger.info(f"Initialized AnomalyScorer with config: {self.config}")
@@ -87,14 +72,8 @@ class AnomalyScorer:
         Fit the error distribution on training (normal) data.
 
         Supports two modes:
-        - "point" (Malhotra et al. 2016): Pool all points across windows,
-          compute μ and σ across features (scalar for univariate)
-        - "window" (legacy): Compute μ and Σ across time axis
-
-        Args:
-            model: Trained LSTM encoder-decoder model
-            train_loader: DataLoader with normal training sequences
-            device: Device to run inference on (cpu/cuda)
+        - "point": Pool all points across windows, compute mu and sigma per feature
+        - "window": Compute mu and Sigma across time axis
         """
         model.eval()
         all_errors = []
@@ -105,33 +84,23 @@ class AnomalyScorer:
             for batch in train_loader:
                 x = batch.to(device)
                 x_reconstructed = model(x)
-
-                # Point-wise absolute error: (batch, seq_len, m)
                 errors = torch.abs(x - x_reconstructed)
                 all_errors.append(errors.cpu().numpy())
 
-        # Concatenate all batches: (num_sequences, seq_len, m)
         all_errors = np.concatenate(all_errors, axis=0)
         num_sequences, seq_len, num_features = all_errors.shape
 
         if self.config.scoring_mode == "point":
-            # Point-level scoring (Malhotra et al. 2016)
-            # Pool all reconstruction errors across all time points and windows
-            # Shape: (num_sequences * seq_len, m)
             all_errors_pooled = all_errors.reshape(-1, num_features)
-
-            # μ shape: (m,) - mean error across all normal points
             self.mu_point = np.mean(all_errors_pooled, axis=0)
 
             if num_features == 1:
-                # Univariate case: compute scalar variance
                 self.sigma_point = np.var(all_errors_pooled, axis=0) + self.config.regularization
                 self.sigma_inv_point = 1.0 / self.sigma_point
                 logger.info(f"Fitted point-level scorer (univariate):")
                 logger.info(f"  mu_point: {self.mu_point[0]:.6f}")
                 logger.info(f"  sigma_point: {self.sigma_point[0]:.6f}")
             else:
-                # Multivariate case: compute full covariance
                 errors_centered = all_errors_pooled - self.mu_point
                 self.cov_point = np.cov(errors_centered, rowvar=False)
                 self.cov_point += self.config.regularization * np.eye(num_features)
@@ -140,12 +109,10 @@ class AnomalyScorer:
                 except np.linalg.LinAlgError:
                     logger.warning("Point-level covariance singular, using pseudo-inverse")
                     self.cov_inv_point = np.linalg.pinv(self.cov_point)
-                logger.info(f"Fitted point-level scorer (multivariate, m={num_features}):")
-                logger.info(f"  mu_point shape: {self.mu_point.shape}")
-                logger.info(f"  cov_point shape: {self.cov_point.shape}")
+                logger.info(f"Fitted point-level scorer (multivariate, m={num_features})")
 
             # Also fit window-level for backward compatibility
-            all_errors_squeezed = all_errors.squeeze(-1)  # (num_sequences, seq_len)
+            all_errors_squeezed = all_errors.squeeze(-1)
             self.mu = np.mean(all_errors_squeezed, axis=0)
             errors_centered = all_errors_squeezed - self.mu
             self.cov = np.cov(errors_centered, rowvar=False)
@@ -156,9 +123,8 @@ class AnomalyScorer:
                 self.cov_inv = np.linalg.pinv(self.cov)
 
         else:
-            # Window-level scoring (legacy)
-            all_errors = all_errors.squeeze(-1)  # (num_sequences, seq_len)
-            self.mu = np.mean(all_errors, axis=0)  # (seq_len,)
+            all_errors = all_errors.squeeze(-1)
+            self.mu = np.mean(all_errors, axis=0)
             errors_centered = all_errors - self.mu
             self.cov = np.cov(errors_centered, rowvar=False)
             self.cov += self.config.regularization * np.eye(seq_len)
@@ -171,25 +137,13 @@ class AnomalyScorer:
             logger.info(f"Fitted window-level scorer:")
             logger.info(f"  Mean error range: [{self.mu.min():.4f}, {self.mu.max():.4f}]")
             logger.info(f"  Covariance matrix shape: {self.cov.shape}")
-            logger.info(f"  Covariance condition number: {np.linalg.cond(self.cov):.2e}")
 
         self.is_fitted = True
         logger.info(f"Fitted on {num_sequences} sequences of length {seq_len}")
 
     def _mahalanobis_distance(self, error: np.ndarray) -> float:
-        """
-        Compute Mahalanobis distance for a single error vector.
-
-        d² = (e - μ)ᵀ Σ⁻¹ (e - μ)
-
-        Args:
-            error: Error vector, shape (seq_len,)
-
-        Returns:
-            Squared Mahalanobis distance (anomaly score)
-        """
-        diff = error - self.mu  # (seq_len,)
-        # d² = diff @ Σ⁻¹ @ diff
+        """Compute Mahalanobis distance for a single error vector."""
+        diff = error - self.mu
         return diff @ self.cov_inv @ diff
 
     def compute_scores(
@@ -199,17 +153,10 @@ class AnomalyScorer:
         device: torch.device
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute anomaly scores for sequences using Mahalanobis distance.
-
-        Args:
-            model: Trained LSTM encoder-decoder model
-            data_loader: DataLoader with sequences to score
-            device: Device to run inference on
+        Compute window-level anomaly scores using Mahalanobis distance.
 
         Returns:
-            Tuple of:
-                - sequence_scores: Mahalanobis distance per sequence, shape (num_sequences,)
-                - reconstruction_errors: Raw errors, shape (num_sequences, seq_len)
+            Tuple of (sequence_scores, reconstruction_errors)
         """
         if not self.is_fitted:
             raise ValueError("Scorer not fitted. Call fit() first.")
@@ -222,15 +169,10 @@ class AnomalyScorer:
             for batch in data_loader:
                 x = batch.to(device)
                 x_reconstructed = model(x)
-
-                # Point-wise absolute error: (batch, seq_len)
                 errors = torch.abs(x - x_reconstructed).cpu().numpy().squeeze(-1)
-
-                # Compute Mahalanobis distance for each sequence in batch
                 for error in errors:
                     score = self._mahalanobis_distance(error)
                     all_scores.append(score)
-
                 all_errors.append(errors)
 
         return np.array(all_scores), np.concatenate(all_errors, axis=0)
@@ -242,28 +184,15 @@ class AnomalyScorer:
         device: torch.device
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Compute per-point anomaly scores for all sequences.
+        Compute per-point anomaly scores (Malhotra et al. 2016).
 
-        Implements Malhotra et al. (2016) point-level scoring:
-        a^(i) = (e^(i) - μ)ᵀ Σ⁻¹ (e^(i) - μ)
-
-        For univariate data (m=1), this simplifies to:
-        a^(i) = ((e^(i) - μ) / σ)²
-
-        Args:
-            model: Trained LSTM encoder-decoder model
-            data_loader: DataLoader with sequences to score
-            device: Device to run inference on
+        For univariate: a^(i) = ((e^(i) - mu) / sigma)^2
 
         Returns:
-            Tuple of:
-                - point_scores: Per-point anomaly scores, shape (num_sequences, seq_len)
-                - window_scores: Max point score per window, shape (num_sequences,)
-                - reconstruction_errors: Raw errors, shape (num_sequences, seq_len, m)
+            Tuple of (point_scores, window_scores, reconstruction_errors)
         """
         if not self.is_fitted:
             raise ValueError("Scorer not fitted. Call fit() first.")
-
         if self.mu_point is None:
             raise ValueError("Point-level parameters not fitted. Ensure scoring_mode='point' during fit().")
 
@@ -275,29 +204,21 @@ class AnomalyScorer:
             for batch in data_loader:
                 x = batch.to(device)
                 x_reconstructed = model(x)
-
-                # Point-wise absolute error: (batch, seq_len, m)
                 errors = torch.abs(x - x_reconstructed).cpu().numpy()
 
-                # Compute point-level Mahalanobis distance
                 if errors.shape[-1] == 1:
-                    # Univariate: (e - μ)² / σ²
-                    errors_squeezed = errors.squeeze(-1)  # (batch, seq_len)
+                    errors_squeezed = errors.squeeze(-1)
                     point_scores = ((errors_squeezed - self.mu_point[0]) ** 2) / self.sigma_point[0]
                 else:
-                    # Multivariate: full Mahalanobis
-                    diff = errors - self.mu_point  # (batch, seq_len, m)
-                    # Compute (diff @ cov_inv @ diff) for each point
+                    diff = errors - self.mu_point
                     point_scores = np.einsum('ijk,kl,ijl->ij', diff, self.cov_inv_point, diff)
 
                 all_point_scores.append(point_scores)
                 all_errors.append(errors)
 
-        point_scores = np.concatenate(all_point_scores, axis=0)  # (num_sequences, seq_len)
-        errors = np.concatenate(all_errors, axis=0)  # (num_sequences, seq_len, m)
-
-        # Window score: max point score in window (Li thesis approach for AUC)
-        window_scores = np.max(point_scores, axis=1)  # (num_sequences,)
+        point_scores = np.concatenate(all_point_scores, axis=0)
+        errors = np.concatenate(all_errors, axis=0)
+        window_scores = np.max(point_scores, axis=1)
 
         return point_scores, window_scores, errors
 
@@ -308,25 +229,7 @@ class AnomalyScorer:
         percentile: Optional[float] = None,
         sigma_k: Optional[float] = None
     ) -> float:
-        """
-        Determine anomaly threshold from validation scores.
-
-        The validation set should contain only normal sequences.
-        The threshold is set such that most normal sequences fall below it.
-
-        Methods:
-            - "percentile": Use nth percentile of validation scores
-            - "sigma": Use mean + k*std of validation scores
-
-        Args:
-            val_scores: Anomaly scores from normal validation sequences
-            method: Threshold method (default from config)
-            percentile: Percentile value for percentile method
-            sigma_k: Number of std deviations for sigma method
-
-        Returns:
-            The computed threshold value
-        """
+        """Set window-level anomaly threshold from validation scores."""
         method = method or self.config.threshold_method
         percentile = percentile or self.config.threshold_percentile
         sigma_k = sigma_k or self.config.threshold_sigma
@@ -338,10 +241,7 @@ class AnomalyScorer:
             mean_score = np.mean(val_scores)
             std_score = np.std(val_scores)
             self.threshold = mean_score + sigma_k * std_score
-            logger.info(
-                f"Set threshold using μ + {sigma_k}σ: {self.threshold:.4f} "
-                f"(μ={mean_score:.4f}, σ={std_score:.4f})"
-            )
+            logger.info(f"Set threshold using mu + {sigma_k}sigma: {self.threshold:.4f}")
         else:
             raise ValueError(f"Unknown threshold method: {method}")
 
@@ -354,23 +254,11 @@ class AnomalyScorer:
         percentile: Optional[float] = None,
         sigma_k: Optional[float] = None
     ) -> float:
-        """
-        Determine point-level anomaly threshold from validation scores.
-
-        Args:
-            val_point_scores: Point-level scores from normal validation, shape (N, T)
-            method: "percentile" or "sigma" (default from config)
-            percentile: Percentile for percentile method
-            sigma_k: Multiplier for sigma method
-
-        Returns:
-            Point-level threshold τ
-        """
+        """Set point-level anomaly threshold from validation scores."""
         method = method or self.config.threshold_method
         percentile = percentile or self.config.threshold_percentile
         sigma_k = sigma_k or self.config.threshold_sigma
 
-        # Flatten all point scores from normal validation windows
         all_scores = val_point_scores.flatten()
 
         if method == "percentile":
@@ -380,10 +268,7 @@ class AnomalyScorer:
             mean_score = np.mean(all_scores)
             std_score = np.std(all_scores)
             self.point_threshold = float(mean_score + sigma_k * std_score)
-            logger.info(
-                f"Set point threshold using μ + {sigma_k}σ: {self.point_threshold:.4f} "
-                f"(μ={mean_score:.4f}, σ={std_score:.4f})"
-            )
+            logger.info(f"Set point threshold using mu + {sigma_k}sigma: {self.point_threshold:.4f}")
         else:
             raise ValueError(f"Unknown threshold method: {method}")
 
@@ -399,24 +284,10 @@ class AnomalyScorer:
         """
         Find optimal threshold using labeled normal and anomaly scores.
 
-        This method enables threshold calibration using both normal validation
-        data and synthetic (or real) anomaly examples, rather than relying
-        solely on percentile-based thresholds from normal data.
-
         Methods:
             - "midpoint": Midpoint between max(normal) and min(anomaly)
-              Falls back to 99th percentile of normal if distributions overlap.
-            - "f1_max": Search for threshold that maximizes F1 (or F-beta) score
-            - "youden": Maximize Youden's J statistic (sensitivity + specificity - 1)
-
-        Args:
-            normal_scores: Scores from normal validation windows
-            anomaly_scores: Scores from synthetic/real anomaly windows
-            method: Calibration method ("midpoint", "f1_max", "youden")
-            beta: Beta for F-beta score (only used with f1_max method)
-
-        Returns:
-            Tuple of (optimal_threshold, calibration_metrics)
+            - "f1_max": Search for threshold that maximizes F-beta score
+            - "youden": Maximize Youden's J statistic
         """
         max_normal = np.max(normal_scores)
         min_anomaly = np.min(anomaly_scores)
@@ -432,30 +303,23 @@ class AnomalyScorer:
 
         if method == "midpoint":
             if gap > 0:
-                # Perfect separation possible - use midpoint
                 threshold = (max_normal + min_anomaly) / 2
                 metrics["threshold_source"] = "midpoint"
             else:
-                # Overlap exists - fall back to high percentile of normal
                 threshold = float(np.percentile(normal_scores, 99))
                 metrics["threshold_source"] = "fallback_percentile_99"
                 logger.warning(
                     f"Distributions overlap (gap={gap:.2f}), "
                     f"falling back to 99th percentile: {threshold:.4f}"
                 )
-
-            logger.info(f"Optimal threshold (midpoint): {threshold:.4f}")
             return threshold, metrics
 
         elif method == "f1_max":
-            # Search over candidate thresholds
             all_scores = np.concatenate([normal_scores, anomaly_scores])
             labels = np.concatenate([
-                np.zeros(len(normal_scores)),  # 0 = normal
-                np.ones(len(anomaly_scores))   # 1 = anomaly
+                np.zeros(len(normal_scores)),
+                np.ones(len(anomaly_scores))
             ])
-
-            # Generate candidate thresholds between min and max
             candidates = np.percentile(all_scores, np.arange(1, 100, 0.5))
 
             best_f_beta = 0
@@ -481,17 +345,14 @@ class AnomalyScorer:
 
             metrics["best_f_beta"] = float(best_f_beta)
             metrics["beta"] = beta
-            logger.info(f"Optimal threshold (F{beta:.1f} max): {best_threshold:.4f} (F={best_f_beta:.4f})")
             return best_threshold, metrics
 
         elif method == "youden":
-            # Maximize Youden's J = sensitivity + specificity - 1
             all_scores = np.concatenate([normal_scores, anomaly_scores])
             labels = np.concatenate([
                 np.zeros(len(normal_scores)),
                 np.ones(len(anomaly_scores))
             ])
-
             candidates = np.percentile(all_scores, np.arange(1, 100, 0.5))
 
             best_j = -1
@@ -513,40 +374,21 @@ class AnomalyScorer:
                     best_threshold = float(candidate)
 
             metrics["best_youden_j"] = float(best_j)
-            logger.info(f"Optimal threshold (Youden): {best_threshold:.4f} (J={best_j:.4f})")
             return best_threshold, metrics
 
         else:
             raise ValueError(f"Unknown calibration method: {method}")
 
     def predict(self, scores: np.ndarray) -> np.ndarray:
-        """
-        Predict anomalies based on threshold.
-
-        Args:
-            scores: Anomaly scores, shape (num_sequences,)
-
-        Returns:
-            Boolean array where True = anomaly, shape (num_sequences,)
-        """
+        """Predict anomalies based on window-level threshold."""
         if self.threshold is None:
             raise ValueError("Threshold not set. Call set_threshold() first.")
-
         return scores > self.threshold
 
     def predict_points(self, point_scores: np.ndarray) -> np.ndarray:
-        """
-        Predict point-level anomalies based on point threshold.
-
-        Args:
-            point_scores: Point-level anomaly scores, shape (num_sequences, seq_len)
-
-        Returns:
-            Boolean array where True = anomaly, shape (num_sequences, seq_len)
-        """
+        """Predict point-level anomalies based on point threshold."""
         if self.point_threshold is None:
             raise ValueError("Point threshold not set. Call set_point_threshold() first.")
-
         return point_scores > self.point_threshold
 
     def predict_windows_from_points(
@@ -558,28 +400,15 @@ class AnomalyScorer:
         Derive window-level labels using HardCriterion.
 
         A window is flagged as anomalous if k or more points exceed the threshold.
-        This implements the HardCriterion from Li's thesis.
-
-        Args:
-            point_predictions: Boolean array of point predictions, shape (num_sequences, seq_len)
-            k: Number of anomalous points required to flag window (default from config)
-
-        Returns:
-            Boolean array of window predictions, shape (num_sequences,)
         """
         k = k or self.config.hard_criterion_k
-
-        # Count anomalous points per window
         anomalous_point_counts = np.sum(point_predictions, axis=1)
-
-        # Apply HardCriterion: window is anomalous if >= k points exceed threshold
         window_predictions = anomalous_point_counts >= k
 
         logger.debug(
             f"HardCriterion (k={k}): {window_predictions.sum()}/{len(window_predictions)} "
             f"windows flagged as anomalous"
         )
-
         return window_predictions
 
     def localize_anomaly(
@@ -591,32 +420,8 @@ class AnomalyScorer:
         """
         Localize anomaly within a flagged window using sliding window analysis.
 
-        After a window is flagged as anomalous by the Mahalanobis score, this method
-        identifies the sub-window where anomalous behavior is most concentrated.
-
-        Algorithm:
-        1. For each scale h (in hours), compute sliding window sums of point scores
-        2. Find the position t* with maximum aggregate score
-        3. Compute contrast ratio: rho = max(S) / mean(S)
-        4. Select the scale with highest contrast ratio (most concentrated anomaly)
-
-        Args:
-            point_scores: Array of shape (seq_len,) with per-point anomaly scores
-            timestamps: List of timestamps corresponding to each point
-            scales_hours: Window sizes in hours to analyze (default: [1, 2, 3, 6, 12, 24, 48])
-                         Each hour = 2 samples at 30-minute intervals
-
-        Returns:
-            Dict with localization results:
-                - anomaly_start: Start timestamp of localized sub-window
-                - anomaly_end: End timestamp of localized sub-window
-                - anomaly_start_idx: Start index in the window
-                - anomaly_end_idx: End index in the window
-                - scale_hours: Best localization scale (hours)
-                - scale_samples: Best localization scale (samples)
-                - contrast_ratio: How concentrated the anomaly is (higher = sharper)
-                - peak_score: Maximum aggregate score at best scale
-                - all_scales: Results for all analyzed scales
+        After a window is flagged, identifies the sub-window where anomalous
+        behavior is most concentrated using a fixed 6-hour window.
         """
         if scales_hours is None:
             scales_hours = [1, 2, 3, 6, 12, 24, 48]
@@ -625,29 +430,21 @@ class AnomalyScorer:
         if seq_len != len(timestamps):
             raise ValueError(f"point_scores length ({seq_len}) != timestamps length ({len(timestamps)})")
 
-        # Compute prefix sum for O(1) sliding window sums
-        # C[i] = sum(point_scores[0:i]), C[0] = 0
         prefix_sum = np.zeros(seq_len + 1)
         prefix_sum[1:] = np.cumsum(point_scores)
 
         all_scales_results = {}
 
         for h in scales_hours:
-            w = h * 2  # Convert hours to samples (30-min intervals)
-
+            w = h * 2  # hours to samples (30-min intervals)
             if w > seq_len:
-                logger.debug(f"Scale {h}h ({w} samples) exceeds sequence length ({seq_len}), skipping")
                 continue
 
-            # Compute sliding sums: S[t] = C[t+w] - C[t] for t in [0, seq_len-w]
             num_positions = seq_len - w + 1
             sliding_sums = prefix_sum[w:seq_len + 1] - prefix_sum[:num_positions]
 
-            # Find peak position
             t_star = int(np.argmax(sliding_sums))
             peak_score = float(sliding_sums[t_star])
-
-            # Compute contrast ratio: how much the peak stands out from the mean
             mean_sum = float(np.mean(sliding_sums))
             rho = peak_score / mean_sum if mean_sum > 0 else 0.0
 
@@ -660,15 +457,11 @@ class AnomalyScorer:
                 "window_samples": w,
             }
 
-        # Scale selection using absolute error thresholds:
-        # Fixed 6h window, select the one with:
-        # 1. Most 30-min intervals above absolute error threshold (0.2), OR
-        # 2. Contains a spike >= 8x the window's average error
-        best_scale_h = 6  # Fixed 6h window
-        best_w = 12  # 6h = 12 samples at 30-min intervals
+        # Fixed 6h window selection
+        best_scale_h = 6
+        best_w = 12
 
         if best_scale_h not in all_scales_results:
-            # Fallback if 6h not computed
             best_scale_h = min(all_scales_results.keys()) if all_scales_results else 6
             best_w = best_scale_h * 2
 
@@ -684,13 +477,9 @@ class AnomalyScorer:
             window_scores = point_scores[t:t + best_w]
             window_mean = np.mean(window_scores)
 
-            # Count points above absolute threshold
             count_above = np.sum(window_scores > error_threshold)
-
-            # Check for extreme spike (8x window average)
             has_spike = np.any(window_scores >= spike_multiplier * window_mean) if window_mean > 0 else False
 
-            # Prefer windows with spikes, then by count
             if has_spike and not best_has_spike:
                 best_t_star = t
                 best_count = count_above
@@ -702,11 +491,10 @@ class AnomalyScorer:
 
         best_rho = all_scales_results.get(best_scale_h, {}).get("contrast_ratio", 0.0)
 
-        # Get timestamps for the localized region
         anomaly_start_idx = best_t_star
         anomaly_end_idx = min(best_t_star + best_w - 1, seq_len - 1)
 
-        result = {
+        return {
             "anomaly_start": timestamps[anomaly_start_idx],
             "anomaly_end": timestamps[anomaly_end_idx],
             "anomaly_start_idx": anomaly_start_idx,
@@ -718,36 +506,15 @@ class AnomalyScorer:
             "all_scales": all_scales_results,
         }
 
-        logger.debug(
-            f"Localized anomaly to [{anomaly_start_idx}:{anomaly_end_idx}] "
-            f"({best_scale_h}h window, contrast={best_rho:.2f})"
-        )
-
-        return result
-
     def score_and_predict(
         self,
         model: torch.nn.Module,
         data_loader: DataLoader,
         device: torch.device
     ) -> Dict[str, np.ndarray]:
-        """
-        Convenience method to compute scores and predictions in one call.
-
-        Args:
-            model: Trained LSTM encoder-decoder model
-            data_loader: DataLoader with sequences to evaluate
-            device: Device to run inference on
-
-        Returns:
-            Dict with keys:
-                - scores: Sequence-level anomaly scores (Mahalanobis distance)
-                - errors: Raw reconstruction errors
-                - predictions: Boolean anomaly predictions
-        """
+        """Compute scores and predictions in one call."""
         scores, errors = self.compute_scores(model, data_loader, device)
         predictions = self.predict(scores)
-
         return {
             "scores": scores,
             "errors": errors,
@@ -773,7 +540,6 @@ class AnomalyScorer:
             stats["cov_shape"] = self.cov.shape
             stats["cov_condition_number"] = float(np.linalg.cond(self.cov))
 
-        # Point-level stats
         if self.mu_point is not None:
             stats["mu_point"] = float(self.mu_point[0]) if len(self.mu_point) == 1 else self.mu_point.tolist()
             stats["sigma_point"] = float(self.sigma_point[0]) if self.sigma_point is not None and len(self.sigma_point) == 1 else None
@@ -782,21 +548,14 @@ class AnomalyScorer:
         return stats
 
     def save(self, filepath: str) -> None:
-        """
-        Save scorer state to file.
-
-        Args:
-            filepath: Path to save the scorer
-        """
+        """Save scorer state to file."""
         state = {
-            # Window-level attributes (legacy)
             "mu": self.mu,
             "cov": self.cov,
             "cov_inv": self.cov_inv,
             "threshold": self.threshold,
             "config": self.config,
             "is_fitted": self.is_fitted,
-            # Point-level attributes (Malhotra et al. 2016)
             "mu_point": self.mu_point,
             "sigma_point": self.sigma_point,
             "sigma_inv_point": self.sigma_inv_point,
@@ -815,29 +574,17 @@ class AnomalyScorer:
 
     @classmethod
     def load(cls, filepath: str) -> "AnomalyScorer":
-        """
-        Load scorer state from file.
-
-        Handles both legacy (window-level only) and new (point-level) scorers.
-
-        Args:
-            filepath: Path to load the scorer from
-
-        Returns:
-            Loaded AnomalyScorer instance
-        """
+        """Load scorer state from file."""
         with open(filepath, "rb") as f:
             state = pickle.load(f)
 
         scorer = cls(config=state["config"])
-        # Window-level attributes (always present)
         scorer.mu = state["mu"]
         scorer.cov = state["cov"]
         scorer.cov_inv = state["cov_inv"]
         scorer.threshold = state["threshold"]
         scorer.is_fitted = state["is_fitted"]
 
-        # Point-level attributes (may not be present in legacy scorers)
         scorer.mu_point = state.get("mu_point")
         scorer.sigma_point = state.get("sigma_point")
         scorer.sigma_inv_point = state.get("sigma_inv_point")
@@ -849,98 +596,3 @@ class AnomalyScorer:
         if scorer.mu_point is not None:
             logger.info(f"  Point-level scoring enabled (mu_point={scorer.mu_point[0]:.6f})")
         return scorer
-
-
-def main():
-    """Test the anomaly scorer with dummy data."""
-    import sys
-    sys.path.insert(0, ".")
-
-    from lstm_autoencoder import create_model
-    from data_preprocessor import NYCTaxiPreprocessor
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-
-    print("\n" + "=" * 60)
-    print("ANOMALY SCORER TEST")
-    print("=" * 60)
-
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nUsing device: {device}")
-
-    # Load and preprocess data
-    print("\nLoading data...")
-    preprocessor = NYCTaxiPreprocessor()
-    dataloaders, _ = preprocessor.preprocess("data/nyc_taxi.csv", batch_size=4)
-
-    # Create model (untrained - just for testing scorer mechanics)
-    print("\nCreating model...")
-    model = create_model(hidden_dim=64, num_layers=1)
-    model.to(device)
-
-    # Create scorer
-    print("\nTesting AnomalyScorer...")
-    scorer = AnomalyScorer()
-
-    # Fit on training data
-    print("\n1. Fitting error distribution on training data...")
-    scorer.fit(model, dataloaders["train"], device)
-
-    print(f"\nScorer stats after fit:")
-    for key, value in scorer.get_stats().items():
-        print(f"  {key}: {value}")
-
-    # Compute scores on validation data (for threshold)
-    print("\n2. Computing scores on validation data...")
-    val_scores, val_errors = scorer.compute_scores(
-        model, dataloaders["threshold_val"], device
-    )
-    print(f"  Validation scores shape: {val_scores.shape}")
-    print(f"  Score range: [{val_scores.min():.4f}, {val_scores.max():.4f}]")
-
-    # Set threshold
-    print("\n3. Setting threshold...")
-    threshold = scorer.set_threshold(val_scores, method="percentile", percentile=95)
-    print(f"  Threshold (95th percentile): {threshold:.4f}")
-
-    # Compute scores on test data
-    print("\n4. Computing scores on test data...")
-    test_scores, test_errors = scorer.compute_scores(
-        model, dataloaders["test"], device
-    )
-    print(f"  Test scores shape: {test_scores.shape}")
-    print(f"  Score range: [{test_scores.min():.4f}, {test_scores.max():.4f}]")
-
-    # Predict anomalies
-    print("\n5. Predicting anomalies...")
-    predictions = scorer.predict(test_scores)
-    num_anomalies = predictions.sum()
-    print(f"  Predicted anomalies: {num_anomalies}/{len(predictions)}")
-
-    # Test save/load
-    print("\n6. Testing save/load...")
-    scorer.save("/tmp/test_scorer.pkl")
-    loaded_scorer = AnomalyScorer.load("/tmp/test_scorer.pkl")
-    print(f"  Loaded threshold: {loaded_scorer.threshold:.4f}")
-    assert loaded_scorer.threshold == scorer.threshold, "Load failed!"
-
-    # Get test week info for context
-    print("\n7. Test week anomaly status:")
-    test_week_info = preprocessor.get_test_week_info()
-    for i, (score, pred, week) in enumerate(zip(test_scores, predictions, test_week_info)):
-        status = "ANOMALY" if pred else "normal"
-        actual = "HAS_ANOMALY" if week["is_anomaly"] else "normal"
-        match = "✓" if (pred == week["is_anomaly"]) else "✗"
-        print(f"  Week {week['year_week']}: score={score:.2f}, pred={status:7s}, actual={actual:10s} {match}")
-
-    print("\n" + "=" * 60)
-    print("ALL TESTS PASSED")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()

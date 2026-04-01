@@ -6,16 +6,14 @@ Detailed architecture and internals of the LSTM Encoder-Decoder (EncDec-AD) anom
 
 ## Table of Contents
 
-1. [Core Model Architecture](#1-core-model-architecture)
-2. [Scoring System](#2-scoring-system)
-3. [Data Preprocessing](#3-data-preprocessing)
-4. [Streaming Detector](#4-streaming-detector)
-5. [Isolation Forest Detector](#5-isolation-forest-detector)
-6. [Training Pipeline](#6-training-pipeline)
-7. [Evaluation](#7-evaluation)
-8. [Streaming Pipeline](#8-streaming-pipeline)
-9. [Docker Infrastructure](#9-docker-infrastructure)
-10. [Configuration Reference](#10-configuration-reference)
+1. [Core Model Architecture](#1-core-model-architecture) — `src/model.py`
+2. [Scoring System](#2-scoring-system) — `src/scorer.py`
+3. [Data Preprocessing](#3-data-preprocessing) — `src/preprocess.py`
+4. [Training Pipeline](#4-training-pipeline) — `code/4_train_model.py`
+5. [Evaluation](#5-evaluation) — `code/5_evaluate_model.py`
+6. [Streaming Application](#6-streaming-application) — `code/6_streaming_app.py`
+7. [Docker Infrastructure](#7-docker-infrastructure)
+8. [Configuration Reference](#8-configuration-reference)
 
 ---
 
@@ -25,7 +23,7 @@ Implementation of the EncDec-AD architecture from [Malhotra et al. (2016)](https
 
 ### 1.1 ModelConfig
 
-All architecture hyperparameters are centralized in the `ModelConfig` dataclass (`app/lstm_autoencoder.py`):
+All architecture hyperparameters are centralized in the `ModelConfig` dataclass (`src/model.py`):
 
 ```python
 @dataclass
@@ -96,7 +94,7 @@ With default config (hidden_dim=64, num_layers=1, input_dim=1): **~33K parameter
 
 ## 2. Scoring System
 
-Implemented in `app/anomaly_scorer.py`. Two scoring modes are available.
+Implemented in `src/scorer.py`. Two scoring modes are available.
 
 ### 2.1 Point-Level Scoring (Default — Malhotra et al. 2016)
 
@@ -145,7 +143,7 @@ When a window is flagged, the scorer identifies the most anomalous sub-region:
 
 ## 3. Data Preprocessing
 
-Implemented in `app/data_preprocessor.py`.
+Implemented in `src/preprocess.py`.
 
 ### 3.1 Dataset
 
@@ -188,7 +186,7 @@ Following Malhotra et al.:
 
 ## 4. Streaming Detector
 
-Implemented in `app/streaming_detector.py`. `LSTMStreamingDetector` extends `BaseDetector` and wraps the trained model for real-time use.
+Detection logic is implemented as functions in `code/6_streaming_app.py`: `load_model_artifacts()` and `detect_anomalies()`.
 
 ### 4.1 Artifact Loading
 
@@ -240,7 +238,7 @@ Scoring uses **channel 0 only** to prevent dilution from near-zero DoW reconstru
 
 ## 5. Isolation Forest Detector
 
-Implemented in `app/isolation_forest_detector.py`. An alternative detection mode that requires no pre-training.
+*Note: The Isolation Forest detector has been removed in the refactored version. The LSTM Encoder-Decoder is the primary detection mode.*
 
 ### 5.1 Configuration
 
@@ -273,7 +271,7 @@ The model is **re-fitted on each detection cycle** using the current sliding win
 
 ## 6. Training Pipeline
 
-Implemented in `app/train.py`.
+Implemented in `code/4_train_model.py`.
 
 ### 6.1 Training Loop
 
@@ -305,7 +303,7 @@ After training, the error distribution is fitted on **validation data** (not tra
 
 ## 7. Evaluation
 
-Implemented in `app/evaluate.py`.
+Implemented in `code/5_evaluate_model.py`.
 
 ### 7.1 Metrics
 
@@ -331,7 +329,7 @@ Generated in the `results/` directory:
 
 ## 8. Streaming Pipeline
 
-Implemented in `app/main.py`. Orchestrates Kafka consumption, Spark processing, and Dash visualization.
+Implemented in `code/6_streaming_app.py`. Orchestrates Kafka consumption, Spark processing, and Dash visualization.
 
 ### 8.1 Data Flow
 
@@ -432,19 +430,19 @@ Defined in `docker-compose.yml`. Six services on a shared `streaming_network` br
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
-| `hidden_dim` | 64 | Grid search (`app/optimize_hyperparams.py`) |
+| `hidden_dim` | 64 | Grid search (`code/7_optimize.py --mode hyperparams`) |
 | `num_layers` | 1 | Grid search |
 | `dropout` | 0.2 | Grid search |
 | `learning_rate` | 5e-4 | Grid search |
 | `threshold_percentile` | 99.99% | Grid search |
-| `train_weeks` | 8 | Split optimization (`app/optimize_split.py`) |
+| `train_weeks` | 8 | Split optimization (`code/7_optimize.py --mode split`) |
 | `val_weeks` | 2 | Split optimization |
 | `threshold_weeks` | 4 | Split optimization |
 | `hard_criterion_k` | 5 | Manual tuning |
 
 ### 10.3 Base Detector Interface
 
-All detectors implement `BaseDetector` (`app/base_detector.py`):
+Detection is implemented as functions in `code/6_streaming_app.py`:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
