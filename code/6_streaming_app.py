@@ -37,7 +37,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.model import EncDecAD, ModelConfig
-from src.scorer import AnomalyScorer
+from src.scorer import AnomalyScorer, ScorerConfig
+
+# Register old module paths so pickled artifacts (saved with old names) can be loaded
+import src.model, src.scorer
+sys.modules["lstm_autoencoder"] = src.model
+sys.modules["anomaly_scorer"] = src.scorer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

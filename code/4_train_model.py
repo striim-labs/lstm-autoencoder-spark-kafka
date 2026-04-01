@@ -36,6 +36,11 @@ from src.preprocess import (
 )
 from src.synthetic import SyntheticAnomalyConfig, generate_synthetic_dataset
 
+# Register old module paths so pickled artifacts (saved with old names) can be loaded
+import src.model, src.scorer
+sys.modules["lstm_autoencoder"] = src.model
+sys.modules["anomaly_scorer"] = src.scorer
+
 logger = logging.getLogger(__name__)
 
 

@@ -30,6 +30,11 @@ from src.preprocess import (
     get_test_week_info,
 )
 
+# Register old module paths so pickled artifacts (saved with old names) can be loaded
+import src.model, src.scorer
+sys.modules["lstm_autoencoder"] = src.model
+sys.modules["anomaly_scorer"] = src.scorer
+
 try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
