@@ -12,7 +12,7 @@ Based on [Malhotra et al. (2016)](https://arxiv.org/abs/1607.00148): "LSTM-based
 lstm-autoencoder-spark-kafka/
 │
 ├── code/                                    # Numbered workflow (start here)
-│   ├── 0_verify_setup.py                    # Verify environment, data, artifacts
+│   ├── 0_verify_setup.py                    # Optional environment / artifact check
 │   ├── 1_data_exploration.ipynb             # EDA: patterns, seasonality, motivation
 │   ├── 2_model_design.ipynb                 # Architecture walkthrough, train demo
 │   ├── 3_train_model.py                     # Full training pipeline
@@ -81,6 +81,8 @@ Work through the notebooks in order:
 Both notebooks run cell-by-cell with no external setup beyond `uv sync`. All cells are self-contained — just press Shift+Enter through them.
 
 > **Note:** A pre-trained model is included in `models/`. The model design notebook trains a small demo model (10 epochs) for illustration, but the pre-trained model was trained with full hyperparameter optimization.
+>
+> `0_verify_setup.py` is optional troubleshooting. You do not need to run it before the notebooks.
 
 ### 3. Run the real-time streaming demo
 
@@ -110,7 +112,7 @@ The numbered files in `code/` tell the full story of the project:
 
 | Step | File | Purpose |
 |------|------|---------|
-| 0 | `0_verify_setup.py` | Verify environment, data, and model artifacts |
+| 0 | `0_verify_setup.py` | Optional troubleshooting: verify environment, data, and model artifacts |
 | 1 | `1_data_exploration.ipynb` | Explore data patterns, motivate the approach |
 | 2 | `2_model_design.ipynb` | Walk through model architecture and scoring |
 | 3 | `3_train_model.py` | Full training pipeline (optional — pre-trained model included) |
@@ -118,7 +120,7 @@ The numbered files in `code/` tell the full story of the project:
 | 5 | `5_streaming_app.py` | Real-time streaming application (Docker entrypoint) |
 | 6 | `6_optimize.py` | Hyperparameter and split optimization (advanced) |
 
-**Start with the notebooks** (steps 1-2) to understand the project. The Python scripts (steps 3-6) are for training, evaluation, and deployment.
+**Start with the notebooks** (steps 1-2) to understand the project. The Python scripts (steps 3-6) are for training, evaluation, and deployment. `0_verify_setup.py` is optional.
 
 ## Architecture
 
