@@ -188,6 +188,7 @@ data_store = {
     "samples_removed": 0,
     "stream_ended": False,
     "spark_ready": False,
+    "user_started": False,
 }
 
 
@@ -403,7 +404,10 @@ def health_check():
     from flask import jsonify
     with data_lock:
         spark_ready = data_store.get("spark_ready", False)
-    return jsonify({"status": "ready" if spark_ready else "starting", "spark_ready": spark_ready, "detector": "lstm"})
+        user_started = data_store.get("user_started", False)
+    # Producer only starts streaming when both Spark is ready AND user clicked Start
+    ready = spark_ready and user_started
+    return jsonify({"status": "ready" if ready else "starting", "spark_ready": ready, "detector": "lstm"})
 
 
 app.layout = dbc.Container([
@@ -413,6 +417,20 @@ app.layout = dbc.Container([
                             style={"color": "white", "fontSize": "24px", "fontWeight": "bold"}),
         ]),
         color=PRIMARY_COLOR, dark=True, sticky="top", className="mb-4",
+    ),
+
+    # Start button — gates data streaming until user is ready
+    html.Div(
+        dbc.Button(
+            "Start Streaming",
+            id="start-button",
+            color="success",
+            size="lg",
+            className="d-block mx-auto",
+            style={"fontSize": "20px", "padding": "15px 60px"},
+        ),
+        id="start-button-container",
+        className="text-center mb-4",
     ),
 
     dbc.Alert(
@@ -486,6 +504,19 @@ app.layout = dbc.Container([
         style={"backgroundColor": PRIMARY_COLOR, "marginTop": "20px"},
     ),
 ], fluid=True, style={"backgroundColor": BACKGROUND_COLOR, "minHeight": "100vh"})
+
+
+@app.callback(
+    Output("start-button-container", "style"),
+    Input("start-button", "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_start_click(n_clicks):
+    """When user clicks Start, signal the producer to begin streaming."""
+    with data_lock:
+        data_store["user_started"] = True
+    logger.info("User clicked Start — producer will begin streaming")
+    return {"display": "none"}
 
 
 @app.callback(
