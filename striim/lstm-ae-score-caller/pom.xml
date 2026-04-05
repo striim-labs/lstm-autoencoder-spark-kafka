@@ -1,0 +1,122 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/maven-v4_0_0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.striim.lstmae</groupId>
+  <artifactId>lstm-ae-score-caller</artifactId>
+  <packaging>jar</packaging>
+  <version>1.0-SNAPSHOT</version>
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <!-- Types are hand-built and bundled in src/main/java/wa/lstmae/ -->
+    <!-- No external types JAR dependency needed -->
+
+    <!-- Striim Open Processor SDK (provided by Striim at runtime) -->
+    <dependency>
+      <groupId>com.striim</groupId>
+      <artifactId>OpenProcessorSDK</artifactId>
+      <version>1.0.0-SNAPSHOT</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Striim Common: UUID, ObjectMapperFactory (needed by hand-built types) -->
+    <dependency>
+      <groupId>com.striim</groupId>
+      <artifactId>Common</artifactId>
+      <version>5.2.0.4</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Kryo (needed by hand-built types for KryoSerializable) -->
+    <dependency>
+      <groupId>com.striim</groupId>
+      <artifactId>kryo</artifactId>
+      <version>2.20</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- JSON parsing (bundled into the fat jar) -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.10.1</version>
+    </dependency>
+
+    <!-- Logging: must be bundled (not provided) for Striim's OpenProcessorLoader -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-api</artifactId>
+      <version>2.17.2</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.17.2</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.10.1</version>
+        <configuration>
+          <source>11</source>
+          <target>11</target>
+        </configuration>
+      </plugin>
+
+      <!-- Shade plugin: produces the fat jar that becomes the .scm -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>2.4.3</version>
+        <configuration>
+          <createDependencyReducedPom>false</createDependencyReducedPom>
+          <finalName>LSTMAEScoreCaller</finalName>
+          <transformers>
+            <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+              <manifestEntries>
+                <Striim-Module-Name>LSTMAEScoreCaller</Striim-Module-Name>
+                <Striim-Service-Interface>
+                  com.webaction.runtime.components.openprocessor.StriimOpenProcessor
+                </Striim-Service-Interface>
+                <Striim-Service-Implementation>
+                  com.striim.lstmae.LSTMAEScoreCaller
+                </Striim-Service-Implementation>
+                <Multi-Release>true</Multi-Release>
+              </manifestEntries>
+            </transformer>
+          </transformers>
+          <filters>
+            <filter>
+              <artifact>com.striim.lstmae:lstm-ae-score-caller</artifact>
+              <excludes>
+                <exclude>wa/lstmae/**</exclude>
+              </excludes>
+            </filter>
+          </filters>
+          <artifactSet>
+            <excludes>
+              <exclude>org.slf4j:*</exclude>
+            </excludes>
+          </artifactSet>
+        </configuration>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

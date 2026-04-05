@@ -1,0 +1,138 @@
+-- ============================================================================
+-- LSTMAE: NYC Taxi Demand Anomaly Detection Pipeline
+--
+-- This TQL creates everything EXCEPT the Open Processor.
+-- After importing, add the Open Processor via Flow Designer:
+--   1. Open LSTMAE in Flow Designer
+--   2. Drag "Open Processor" from Base Components into the workspace
+--   3. Set Input Stream: LSTMAEPayloadStream
+--   4. Set Output Stream: LSTMAEResultStream
+--   5. Set Processor: LSTMAEScoreCaller
+--   6. Set properties: apiEndpoint, timeoutMs, maxRetries
+--   7. Save
+--
+-- Prerequisites:
+--   1. LSTM-AE Scoring API running at http://localhost:8000
+--   2. LSTMAEScoreCaller.scm loaded via:
+--        LOAD OPEN PROCESSOR '/opt/Striim/modules/LSTMAEScoreCaller.scm';
+--   3. NYC taxi CSV in /tmp/lstmae_test/
+--
+-- Namespace: lstmae
+-- ============================================================================
+
+CREATE APPLICATION LSTMAE;
+
+-- Types (LSTMAEPayload, LSTMAEResult) must already exist in the lstmae
+-- namespace before importing this TQL. See Step 5 in STRIIM_LSTMAE.md.
+
+-- ============================================================================
+-- Stage 1: Ingest raw taxi demand rows from CSV
+-- ============================================================================
+
+CREATE SOURCE TaxiFileSource USING FileReader (
+  directory: '/tmp/lstmae_test',
+  wildcard: 'nyc_taxi*.csv',
+  positionByEOF: false
+)
+PARSE USING DSVParser (
+  columndelimiter: ',',
+  header: true
+)
+OUTPUT TO RawTaxiStream;
+
+-- ============================================================================
+-- Stage 2: Parse raw WAEvent into typed fields
+--
+-- data[0] = timestamp  ("2014-07-01 00:00:00")
+-- data[1] = value      (integer taxi demand count)
+--
+-- The WHERE clause skips the first 5 days (July 1-5) to align windows
+-- to Sunday boundaries. The model was trained on Sunday-to-Saturday
+-- weeks (PreprocessorConfig.offset_days=5). Without this alignment,
+-- reconstruction errors are inflated and nearly every window scores
+-- as anomalous.
+-- ============================================================================
+
+CREATE CQ ParseTaxiDemand
+INSERT INTO TypedTaxiStream
+SELECT
+  'nyc_taxi'                           AS series_key,
+  TO_DATEF(SLEFT(TO_STRING(data[0]), 19),
+           'yyyy-MM-dd HH:mm:ss')     AS ts,
+  TO_INT(TO_STRING(data[1]))           AS demand_value
+FROM RawTaxiStream;
+
+-- ============================================================================
+-- Stage 3: Collect one week of 30-min data via jumping window
+--
+-- No hourly aggregation needed -- the model expects raw 30-min counts.
+-- Uses a 7-day event-time jumping window to produce one score per week,
+-- matching the model's non-overlapping training paradigm.
+--
+-- PARTITION BY series_key and GROUP BY in the assembly CQ are required
+-- for Striim to emit window output.
+-- ============================================================================
+
+CREATE WINDOW WeeklyWindow
+OVER TypedTaxiStream
+KEEP 336 ROWS
+PARTITION BY series_key;
+
+-- ============================================================================
+-- Stage 4: Assemble the 336-point payload for the scoring API
+--
+-- LIST() preserves chronological insertion order.
+-- HAVING COUNT(*) >= 336 filters incomplete windows during warm-up.
+-- ============================================================================
+
+CREATE STREAM LSTMAEPayloadStream OF lstmae.LSTMAEPayload;
+
+CREATE CQ AssembleWeeklyPayload
+INSERT INTO LSTMAEPayloadStream
+SELECT
+  TO_STRING(LIST(TO_STRING(w.demand_value))) AS values_list,
+  TO_STRING(FIRST(w.ts))             AS window_start,
+  TO_STRING(LAST(w.ts))              AS window_end
+FROM WeeklyWindow w
+GROUP BY w.series_key
+HAVING COUNT(*) >= 336;
+
+-- ============================================================================
+-- Stage 5: Output stream for scored results (populated by Open Processor)
+--
+-- The Open Processor (added via Flow Designer) reads LSTMAEPayloadStream
+-- and writes LSTMAEResult_1_0 events to LSTMAEResultStream.
+-- ============================================================================
+
+CREATE STREAM LSTMAEResultStream OF lstmae.LSTMAEResult;
+
+-- ============================================================================
+-- Stage 6: Project results through a CQ for JSONFormatter compatibility
+--
+-- JSONFormatter cannot introspect hand-built _1_0 type classes (known bug).
+-- This CQ re-projects the fields into a Striim-generated stream type
+-- that JSONFormatter can serialize correctly.
+-- ============================================================================
+
+CREATE CQ ProjectResults
+INSERT INTO FormattedResultStream
+SELECT
+  r.is_anomaly    AS is_anomaly,
+  r.anomaly_score AS anomaly_score,
+  r.threshold     AS threshold,
+  r.window_start  AS window_start,
+  r.window_end    AS window_end
+FROM LSTMAEResultStream r;
+
+-- ============================================================================
+-- Stage 7: Write scored results to JSON file for validation
+-- ============================================================================
+
+CREATE TARGET ResultFile USING FileWriter (
+  directory: '/tmp/lstmae_test',
+  filename: 'scored_output'
+)
+FORMAT USING JSONFormatter ()
+INPUT FROM FormattedResultStream;
+
+END APPLICATION LSTMAE;
