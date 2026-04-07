@@ -3,8 +3,8 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
                              http://maven.apache.org/maven-v4_0_0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>com.striim.lstmae</groupId>
-  <artifactId>lstm-ae-score-caller</artifactId>
+  <groupId>com.striim.nycad</groupId>
+  <artifactId>nycad-scorer</artifactId>
   <packaging>jar</packaging>
   <version>1.0-SNAPSHOT</version>
 
@@ -15,9 +15,6 @@
   </properties>
 
   <dependencies>
-    <!-- Types are hand-built and bundled in src/main/java/wa/lstmae/ -->
-    <!-- No external types JAR dependency needed -->
-
     <!-- Striim Open Processor SDK (provided by Striim at runtime) -->
     <dependency>
       <groupId>com.striim</groupId>
@@ -26,19 +23,11 @@
       <scope>provided</scope>
     </dependency>
 
-    <!-- Striim Common: UUID, ObjectMapperFactory (needed by hand-built types) -->
+    <!-- Striim Common: contains runtime WAEvent class (provided by Striim at runtime) -->
     <dependency>
       <groupId>com.striim</groupId>
       <artifactId>Common</artifactId>
       <version>5.2.0.4</version>
-      <scope>provided</scope>
-    </dependency>
-
-    <!-- Kryo (needed by hand-built types for KryoSerializable) -->
-    <dependency>
-      <groupId>com.striim</groupId>
-      <artifactId>kryo</artifactId>
-      <version>2.20</version>
       <scope>provided</scope>
     </dependency>
 
@@ -81,29 +70,21 @@
         <version>2.4.3</version>
         <configuration>
           <createDependencyReducedPom>false</createDependencyReducedPom>
-          <finalName>LSTMAEScoreCaller</finalName>
+          <finalName>NYCADScorer</finalName>
           <transformers>
             <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
               <manifestEntries>
-                <Striim-Module-Name>LSTMAEScoreCaller</Striim-Module-Name>
+                <Striim-Module-Name>NYCADScorer</Striim-Module-Name>
                 <Striim-Service-Interface>
                   com.webaction.runtime.components.openprocessor.StriimOpenProcessor
                 </Striim-Service-Interface>
                 <Striim-Service-Implementation>
-                  com.striim.lstmae.LSTMAEScoreCaller
+                  com.striim.nycad.NYCADScorer
                 </Striim-Service-Implementation>
                 <Multi-Release>true</Multi-Release>
               </manifestEntries>
             </transformer>
           </transformers>
-          <filters>
-            <filter>
-              <artifact>com.striim.lstmae:lstm-ae-score-caller</artifact>
-              <excludes>
-                <exclude>wa/lstmae/**</exclude>
-              </excludes>
-            </filter>
-          </filters>
           <artifactSet>
             <excludes>
               <exclude>org.slf4j:*</exclude>

@@ -1,0 +1,77 @@
+-- ============================================================================
+-- NYCAD: NYC Taxi Anomaly Detection (windowing inside the OP)
+--
+-- After importing, wire the OP in Flow Designer:
+--   1. Open NYCAD_LSTMAE in Flow Designer
+--   2. Drag "Open Processor" into the workspace
+--   3. Module: NYCADScorer
+--   4. Input Stream: NYCADRawStream
+--   5. Output Stream: NYCADResultStream
+--   6. Save
+--
+-- Prerequisites:
+--   1. Scoring API running at http://localhost:8000
+--   2. NYCADScorer.scm loaded:
+--        LOAD OPEN PROCESSOR "/opt/Striim/modules/NYCADScorer.scm";
+--   3. NYC taxi CSV in /tmp/nycad_test/
+--
+-- Namespace: nycad
+-- ============================================================================
+
+CREATE NAMESPACE nycad;
+USE nycad;
+
+CREATE APPLICATION NYCAD_LSTMAE;
+
+-- ============================================================================
+-- Stage 1: Ingest raw taxi demand rows from CSV
+-- Output is native Global.WAEvent (matches OP annotation)
+-- ============================================================================
+
+CREATE SOURCE NYCADFileSource USING FileReader (
+  directory: '/tmp/nycad_test',
+  wildcard: 'nyc_taxi*.csv',
+  positionByEOF: false
+)
+PARSE USING DSVParser (
+  columndelimiter: ',',
+  header: true
+)
+OUTPUT TO NYCADRawStream;
+
+-- ============================================================================
+-- Stage 2: Open Processor (wire via Flow Designer)
+-- The OP handles parsing, windowing (336-row sliding), and scoring internally.
+-- Input: NYCADRawStream (raw CSV rows as WAEvent)
+-- Output: NYCADResultStream (scored results as WAEvent)
+-- ============================================================================
+
+CREATE STREAM NYCADResultStream OF Global.WAEvent;
+
+-- ============================================================================
+-- Stage 3: Format results for JSONFormatter
+--   OP output data[]: [is_anomaly, anomaly_score, threshold, window_start, window_end]
+-- ============================================================================
+
+CREATE CQ NYCADFormatResults
+INSERT INTO NYCADFormattedStream
+SELECT
+  TO_STRING(data[0]) AS is_anomaly,
+  TO_STRING(data[1]) AS anomaly_score,
+  TO_STRING(data[2]) AS threshold,
+  TO_STRING(data[3]) AS window_start,
+  TO_STRING(data[4]) AS window_end
+FROM NYCADResultStream;
+
+-- ============================================================================
+-- Stage 4: Write to JSON file
+-- ============================================================================
+
+CREATE TARGET NYCADResultFile USING FileWriter (
+  directory: '/tmp/nycad_test',
+  filename: 'scored_output'
+)
+FORMAT USING JSONFormatter ()
+INPUT FROM NYCADFormattedStream;
+
+END APPLICATION NYCAD_LSTMAE;

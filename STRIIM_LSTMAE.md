@@ -1,11 +1,13 @@
 # Striim LSTM-AE Anomaly Detection Pipeline: Setup Guide
 
 **Striim Version:** Platform 5.2.0.4 (OpenJDK 11)
-**Pipeline:** FileReader -> Parse CQ -> 336-Row Sliding Window -> Assembly CQ -> Open Processor (LSTM-AE API) -> ProjectResults CQ -> FileWriter (JSON)
+**Pipeline:** FileReader -> Open Processor (buffering + LSTM-AE API scoring) -> Format CQ -> FileWriter (JSON)
 
-This guide walks through setting up the end-to-end Striim LSTM-AE anomaly detection pipeline. The pipeline ingests NYC taxi demand data (30-minute intervals), assembles weekly windows of 336 data points, scores each window against a pre-trained LSTM Encoder-Decoder model via HTTP, and writes anomaly results to JSON.
+This guide walks through setting up the end-to-end Striim LSTM-AE anomaly detection pipeline. The pipeline ingests NYC taxi demand data (30-minute intervals), buffers 336-point weekly windows inside the Open Processor, scores each window against a pre-trained LSTM Encoder-Decoder model via HTTP, and writes anomaly results to JSON.
 
-The Open Processor and type JARs are pre-built in this repository. You do not need to compile anything.
+This uses the **WAEvent pass-through pattern**: no typed streams, no types JAR, no `CREATE TYPE` statements. The OP reads directly from the FileReader's native `Global.WAEvent` output and handles all parsing, windowing, and scoring internally.
+
+The Open Processor is pre-built in this repository. You do not need to compile anything.
 
 ---
 
@@ -39,17 +41,10 @@ Pre-built artifacts in this repo:
 
 | Artifact | Path | Purpose |
 |---|---|---|
-| OP module (.scm) | `striim/lstm-ae-score-caller/target/LSTMAEScoreCaller.scm` | Striim Open Processor (fat JAR, types excluded) |
-| Types JAR | `striim/lstm-ae-score-caller/target/lstmae_types.jar` | Hand-built `_1_0` type classes for `$STRIIM_HOME/lib/` |
-| TQL | `striim/LSTMAE.tql` | Striim application definition |
+| OP module (.scm) | `striim/nycad-scorer/target/NYCADScorer.scm` | Striim Open Processor (fat JAR, WAEvent pass-through) |
+| TQL | `striim/NYCAD.tql` | Striim application definition (~70 lines) |
 | Data | `data/nyc_taxi_sunday_aligned.csv` | NYC taxi demand data, pre-trimmed to Sunday start |
 | Scoring API | `striim/api/main.py` | FastAPI service wrapping the LSTM-AE model |
-
-If the pre-built `.scm` or types JAR are missing, build them with:
-
-```bash
-cd striim/lstm-ae-score-caller && chmod +x build.sh && ./build.sh
-```
 
 ---
 
@@ -85,73 +80,25 @@ Leave this running in a separate terminal.
 
 ## 3. Deploy to Striim
 
-This is a multi-step process because Striim has two separate type systems (registry and classpath) that must both contain the types, but they conflict during creation.
-
-### 3.1 Install the types JAR and stop Striim
+### 3.1 Copy the .scm module
 
 ```bash
-cp <repo>/striim/lstm-ae-score-caller/target/lstmae_types.jar $STRIIM_HOME/lib/lstmae_types.jar
+cp <repo>/striim/nycad-scorer/target/NYCADScorer.scm $STRIIM_HOME/modules/NYCADScorer.scm
 ```
 
-If Striim is running, stop it with Ctrl+C in the Striim terminal.
-
-### 3.2 JAR Removal Trick: create types without classpath conflict
-
-The types JAR must be absent from `lib/` when creating types (to avoid "class already exists" errors), then restored before running the OP.
+### 3.2 Start Striim (if not already running)
 
 ```bash
-# Move types JAR out temporarily
-mv $STRIIM_HOME/lib/lstmae_types.jar /tmp/lstmae_types.jar
-
-# Start Striim without types on classpath
-$STRIIM_HOME/bin/server.sh   # start
+export JAVA_HOME=/opt/homebrew/opt/openjdk@11
+cd $STRIIM_HOME && bin/server.sh
 ```
 
-### 3.3 Create namespace, types, and import TQL
+### 3.3 Load the Open Processor
 
 In the Striim console:
 
 ```sql
-CREATE NAMESPACE lstmae;
-USE lstmae;
-
-CREATE TYPE LSTMAEPayload (
-  values_list  String,
-  window_start java.lang.String,
-  window_end   java.lang.String
-);
-
-CREATE TYPE LSTMAEResult (
-  is_anomaly    String,
-  anomaly_score String,
-  threshold     String,
-  window_start  String,
-  window_end    String
-);
-```
-
-All statements should return `SUCCESS`. Then import the TQL by pasting the contents of `striim/LSTMAE.tql` into the console (everything from `CREATE APPLICATION LSTMAE` through `END APPLICATION LSTMAE`).
-
-### 3.4 Restore types JAR and restart Striim
-
-Stop Striim with Ctrl+C, then:
-
-```bash
-mv /tmp/lstmae_types.jar $STRIIM_HOME/lib/lstmae_types.jar
-$STRIIM_HOME/bin/server.sh   # start
-```
-
-### 3.5 Copy .scm and load the Open Processor
-
-```bash
-cp <repo>/striim/lstm-ae-score-caller/target/LSTMAEScoreCaller.scm $STRIIM_HOME/modules/LSTMAEScoreCaller.scm
-```
-
-In the Striim console:
-
-```sql
-USE lstmae;
-LOAD OPEN PROCESSOR "/opt/Striim/modules/LSTMAEScoreCaller.scm";
+LOAD OPEN PROCESSOR "/opt/Striim/modules/NYCADScorer.scm";
 ```
 
 Verify:
@@ -160,24 +107,68 @@ Verify:
 LIST OPENPROCESSORS;
 ```
 
-`LSTMAEScoreCaller` should appear in the list.
+`NYCADScorer` should appear in the list.
+
+### 3.4 Import the TQL application
+
+Paste the contents of `striim/NYCAD.tql` into the Striim console. The full TQL is:
+
+```sql
+CREATE NAMESPACE nycad;
+USE nycad;
+
+CREATE APPLICATION NYCAD_LSTMAE;
+
+CREATE SOURCE NYCADFileSource USING FileReader (
+  directory: '/tmp/nycad_test',
+  wildcard: 'nyc_taxi*.csv',
+  positionByEOF: false
+)
+PARSE USING DSVParser (
+  columndelimiter: ',',
+  header: true
+)
+OUTPUT TO NYCADRawStream;
+
+CREATE STREAM NYCADResultStream OF Global.WAEvent;
+
+CREATE CQ NYCADFormatResults
+INSERT INTO NYCADFormattedStream
+SELECT
+  TO_STRING(data[0]) AS is_anomaly,
+  TO_STRING(data[1]) AS anomaly_score,
+  TO_STRING(data[2]) AS threshold,
+  TO_STRING(data[3]) AS window_start,
+  TO_STRING(data[4]) AS window_end
+FROM NYCADResultStream;
+
+CREATE TARGET NYCADResultFile USING FileWriter (
+  directory: '/tmp/nycad_test',
+  filename: 'scored_output'
+)
+FORMAT USING JSONFormatter ()
+INPUT FROM NYCADFormattedStream;
+
+END APPLICATION NYCAD_LSTMAE;
+```
+
+All statements should return `SUCCESS`.
 
 ---
 
 ## 4. Wire the Open Processor in Flow Designer
 
-1. In the Striim web UI, navigate to **Apps** and open `lstmae.LSTMAE`
+This is the only step that cannot be done in TQL. The OP's input stream (`NYCADRawStream`) is a native `Global.WAEvent` from the FileReader, and the annotation uses `com.webaction.proc.events.WAEvent.class`. Flow Designer handles the type bridging between the auto-created stream and the WAEvent annotation.
+
+1. In the Striim web UI, navigate to **Apps** and open `nycad.NYCAD_LSTMAE`
 2. Click to enter **Flow Designer**
-3. Drag **Open Processor** from the component palette into the workspace
+3. Drag **Striim Open Processor** from the Base Components palette into the workspace
 4. Configure:
-   - **Module:** `LSTMAEScoreCaller`
-   - **Input Stream:** `LSTMAEPayloadStream`
-   - **Output Stream:** `LSTMAEResultStream`
-5. Set properties (these have fallback defaults in the Java code, but set them anyway):
-   - `apiEndpoint`: `http://localhost:8000/v1/score`
-   - `timeoutMs`: `5000`
-   - `maxRetries`: `3`
-6. Click **Save**
+   - **Name:** `nycad` (or any name)
+   - **Module:** Select `NYCADScorer` from the dropdown
+   - **Input Stream:** `NYCADRawStream`
+   - **Output Stream:** `NYCADResultStream`
+5. Click **Save**
 
 ---
 
@@ -186,22 +177,18 @@ LIST OPENPROCESSORS;
 ### 5.1 Deploy and start
 
 ```sql
-USE lstmae;
-DEPLOY APPLICATION lstmae.LSTMAE;
-START APPLICATION lstmae.LSTMAE;
+USE nycad;
+DEPLOY APPLICATION nycad.NYCAD_LSTMAE;
+START APPLICATION nycad.NYCAD_LSTMAE;
 ```
-
-The pipeline should appear in Flow Designer with the status "Running":
-
-![Pipeline at startup -- deployed and waiting for data](striim/initial-op.png)
 
 ### 5.2 Copy data file (after app is running)
 
 **Important:** Copy the file AFTER the app starts. FileReader ignores files that already exist when the application launches.
 
 ```bash
-mkdir -p /tmp/lstmae_test
-cp <repo>/data/nyc_taxi_sunday_aligned.csv /tmp/lstmae_test/
+mkdir -p /tmp/nycad_test
+cp <repo>/data/nyc_taxi_sunday_aligned.csv /tmp/nycad_test/
 ```
 
 ### 5.3 Monitor
@@ -217,18 +204,24 @@ score_request score=10110522.2674 is_anomaly=True window=[2015/01/25 00:00:00.00
 **Striim server log:**
 
 ```bash
-grep -i "LSTMAEScoreCaller" $STRIIM_HOME/logs/striim.server.log | tail -10
+grep "NYCADScorer" $STRIIM_HOME/logs/striim.server.log | grep "Scored" | tail -10
 ```
 
-**Flow Designer** -- open the app in the web UI to see record counts on each node. After ingestion completes:
+**Flow Designer** -- open the app in the web UI to see record counts on each node.
 
-![Pipeline after completion -- 10k records ingested, 22 scored windows output](striim/final-op.png)
+During ingestion, the pipeline processes at ~400-700 records/s:
+
+![Pipeline mid-run -- 10k records ingested, OP scoring at 672 records/s](striim/initial-op-nycad.png)
+
+After ingestion completes, Total Output should show **22**:
+
+![Pipeline after completion -- 10k records ingested, 22 scored windows output](striim/final-op-nycad.png)
 
 **Output files:**
 
 ```bash
-ls -la /tmp/lstmae_test/scored_output*
-cat /tmp/lstmae_test/scored_output.00
+ls -la /tmp/nycad_test/scored_output*
+cat /tmp/nycad_test/scored_output.00
 ```
 
 ---
@@ -240,7 +233,7 @@ With the `nyc_taxi_sunday_aligned.csv` dataset (10,080 rows, July 6 2014 through
 | Metric | Value |
 |---|---|
 | Input records | 10,080 |
-| Windows sent to API | ~9,744 (sliding window emits on each new row) |
+| Windows assembled by OP | ~9,744 (sliding window emits on each new row) |
 | Windows actually scored | 22 (API filters to Sunday-aligned, post-training only) |
 | Windows skipped (204) | ~9,722 |
 | API latency | ~10ms per scored window |
@@ -248,11 +241,11 @@ With the `nyc_taxi_sunday_aligned.csv` dataset (10,080 rows, July 6 2014 through
 
 ### How the filtering works
 
-The sliding window (`KEEP 336 ROWS`) emits a new window on every incoming row after the first 336 accumulate. This produces ~9,744 overlapping windows. The scoring API filters these down:
+The OP internally buffers 336 consecutive values (one week of 30-minute data). After the initial fill, every new row triggers a new overlapping window. The OP calls the scoring API for each window. The API filters these down:
 
-1. **Sunday alignment** -- only scores windows whose `window_start` is Sunday at midnight (returns 204 for all others)
+1. **Sunday alignment** -- only scores windows whose `window_start` falls on a Sunday at midnight (returns 204 for all others)
 2. **Training cutoff** -- only scores windows starting on or after Aug 31, 2014 (returns 204 for training-era data)
-3. The OP receives the 204 and silently skips `send()`, so no result is written downstream
+3. The OP receives the 204 (empty response body) and silently skips `send()`, so no result is written downstream
 
 This produces exactly one score per non-overlapping week in the test period.
 
@@ -266,7 +259,8 @@ The model achieves 5/5 detection on known NYC events.
 | 2014-11-23 | 8,480,764 | 5,097,651 | **ANOMALY** | Thanksgiving |
 | 2014-12-21 | 10,472,830 | 5,097,651 | **ANOMALY** | Christmas |
 | 2014-12-28 | 13,543,827 | 5,097,651 | **ANOMALY** | New Year's |
-| 2015-01-25 | 10,110,522 | 5,097,651 | **ANOMALY** | January Blizzard |
+| 2015-01-18 | 5,643,154 | 5,097,651 | **ANOMALY** | January Blizzard (early) |
+| 2015-01-25 | 10,110,522 | 5,097,651 | **ANOMALY** | January Blizzard (peak) |
 
 All 16 normal weeks scored below threshold with zero false positives.
 
@@ -278,8 +272,8 @@ Normal window:
   "is_anomaly": "false",
   "anomaly_score": "2472926.2783990074",
   "threshold": "5097650.624144599",
-  "window_start": "2014/10/12 00:00:00.000",
-  "window_end": "2014/10/18 23:30:00.000"
+  "window_start": "2014-10-12 00:00:00",
+  "window_end": "2014-10-18 23:30:00"
 }
 ```
 
@@ -289,8 +283,8 @@ Anomaly window (NYC Marathon):
   "is_anomaly": "true",
   "anomaly_score": "1.174974631523868E7",
   "threshold": "5097650.624144599",
-  "window_start": "2014/11/02 00:00:00.000",
-  "window_end": "2014/11/08 23:30:00.000"
+  "window_start": "2014-11-02 00:00:00",
+  "window_end": "2014-11-08 23:30:00"
 }
 ```
 
@@ -300,8 +294,8 @@ Anomaly window (January Blizzard):
   "is_anomaly": "true",
   "anomaly_score": "1.0110522267350838E7",
   "threshold": "5097650.624144599",
-  "window_start": "2015/01/25 00:00:00.000",
-  "window_end": "2015/01/31 23:30:00.000"
+  "window_start": "2015-01-25 00:00:00",
+  "window_end": "2015-01-31 23:30:00"
 }
 ```
 
@@ -312,9 +306,9 @@ Anomaly window (January Blizzard):
 ### Stop the application
 
 ```sql
-USE lstmae;
-STOP APPLICATION lstmae.LSTMAE;
-UNDEPLOY APPLICATION lstmae.LSTMAE;
+USE nycad;
+STOP APPLICATION nycad.NYCAD_LSTMAE;
+UNDEPLOY APPLICATION nycad.NYCAD_LSTMAE;
 ```
 
 ### Re-run with same data
@@ -322,41 +316,38 @@ UNDEPLOY APPLICATION lstmae.LSTMAE;
 FileReader tracks files by name. Use a unique filename for each run:
 
 ```bash
-rm -f /tmp/lstmae_test/scored_output*
-rm -f /tmp/lstmae_test/nyc_taxi*.csv
-cp <repo>/data/nyc_taxi_sunday_aligned.csv /tmp/lstmae_test/nyc_taxi.csv
+rm -f /tmp/nycad_test/scored_output*
+rm -f /tmp/nycad_test/nyc_taxi*.csv
+cp <repo>/data/nyc_taxi_sunday_aligned.csv /tmp/nycad_test/nyc_taxi.csv
 ```
 
 Then redeploy and start:
 
 ```sql
-DEPLOY APPLICATION lstmae.LSTMAE;
-START APPLICATION lstmae.LSTMAE;
+DEPLOY APPLICATION nycad.NYCAD_LSTMAE;
+START APPLICATION nycad.NYCAD_LSTMAE;
 ```
 
 ### Full reset
 
 ```sql
-USE lstmae;
-STOP APPLICATION lstmae.LSTMAE;
-UNDEPLOY APPLICATION lstmae.LSTMAE;
-DROP APPLICATION lstmae.LSTMAE CASCADE;
-DROP TYPE lstmae.LSTMAEResult;
-DROP TYPE lstmae.LSTMAEPayload;
+USE nycad;
+STOP APPLICATION nycad.NYCAD_LSTMAE;
+UNDEPLOY APPLICATION nycad.NYCAD_LSTMAE;
+DROP APPLICATION nycad.NYCAD_LSTMAE CASCADE;
 USE admin;
-UNLOAD OPEN PROCESSOR "/opt/Striim/modules/LSTMAEScoreCaller.scm";
-DROP NAMESPACE lstmae;
+UNLOAD OPEN PROCESSOR "/opt/Striim/modules/NYCADScorer.scm";
+DROP NAMESPACE nycad;
 ```
 
 Stop Striim with Ctrl+C, then:
 
 ```bash
-rm -f $STRIIM_HOME/.striim/OpenProcessor/LSTMAEScoreCaller.scm
-rm -f $STRIIM_HOME/modules/LSTMAEScoreCaller.scm
-rm -f $STRIIM_HOME/lib/lstmae_types.jar
-rm -f /tmp/lstmae_test/scored_output*
-rm -f /tmp/lstmae_test/nyc_taxi*.csv
-$STRIIM_HOME/bin/server.sh   # start
+rm -f $STRIIM_HOME/.striim/OpenProcessor/NYCADScorer.scm
+rm -f $STRIIM_HOME/modules/NYCADScorer.scm
+rm -f /tmp/nycad_test/scored_output*
+rm -f /tmp/nycad_test/nyc_taxi*.csv
+$STRIIM_HOME/bin/server.sh
 ```
 
 Then start from [Step 3](#3-deploy-to-striim).
@@ -366,22 +357,13 @@ Then start from [Step 3](#3-deploy-to-striim).
 ## Deployment Order (Quick Reference)
 
 ```
- 1. Start scoring API        python -m uvicorn striim.api.main:app --port 8000
- 2. Install types JAR        cp target/lstmae_types.jar $STRIIM_HOME/lib/
- 3. Stop Striim              Ctrl+C in Striim terminal
- 4. Remove types JAR         mv $STRIIM_HOME/lib/lstmae_types.jar /tmp/
- 5. Start Striim             $STRIIM_HOME/bin/server.sh
- 6. CREATE NAMESPACE         CREATE NAMESPACE lstmae;
- 7. CREATE TYPEs             CREATE TYPE LSTMAEPayload (...); CREATE TYPE LSTMAEResult (...);
- 8. Paste TQL                CREATE APPLICATION LSTMAE; ... END APPLICATION LSTMAE;
- 9. Stop Striim              Ctrl+C in Striim terminal
-10. Restore types JAR        mv /tmp/lstmae_types.jar $STRIIM_HOME/lib/
-11. Start Striim             $STRIIM_HOME/bin/server.sh
-12. Copy .scm                cp target/LSTMAEScoreCaller.scm $STRIIM_HOME/modules/
-13. LOAD OP                  LOAD OPEN PROCESSOR "/opt/Striim/modules/LSTMAEScoreCaller.scm";
-14. Wire OP                  Flow Designer: LSTMAEPayloadStream -> OP -> LSTMAEResultStream
-15. Deploy + Start           DEPLOY APPLICATION lstmae.LSTMAE; START APPLICATION lstmae.LSTMAE;
-16. Copy data file           cp data/nyc_taxi_sunday_aligned.csv /tmp/lstmae_test/
+1. Start scoring API         python -m uvicorn striim.api.main:app --port 8000
+2. Copy .scm                 cp target/NYCADScorer.scm $STRIIM_HOME/modules/
+3. Start Striim              $STRIIM_HOME/bin/server.sh
+4. LOAD OP                   LOAD OPEN PROCESSOR "/opt/Striim/modules/NYCADScorer.scm";
+5. Paste TQL                 CREATE NAMESPACE nycad; USE nycad; ... END APPLICATION;
+6. Wire OP in Flow Designer  NYCADRawStream -> NYCADScorer -> NYCADResultStream
+7. Deploy + Start + Data     DEPLOY; START; cp data to /tmp/nycad_test/
 ```
 
 ---
@@ -389,44 +371,55 @@ Then start from [Step 3](#3-deploy-to-striim).
 ## Data Flow
 
 ```
-TaxiFileSource (FileReader + DSVParser, watches /tmp/lstmae_test/)
+NYCADFileSource (FileReader + DSVParser, watches /tmp/nycad_test/)
     |
     v
-RawTaxiStream (WAEvent: data[0]=timestamp, data[1]=value)
+NYCADRawStream (native Global.WAEvent: data[0]=timestamp, data[1]=value)
     |
     v
-ParseTaxiDemand CQ (series_key='nyc_taxi', TO_DATEF for ts, TO_INT for demand_value)
-    |
-    v
-TypedTaxiStream (series_key, ts, demand_value)
-    |
-    v
-WeeklyWindow (KEEP 336 ROWS, PARTITION BY series_key)
-    |
-    v
-AssembleWeeklyPayload CQ (LIST() of 336 values, GROUP BY series_key, HAVING COUNT >= 336)
-    |
-    v
-LSTMAEPayloadStream (values_list, window_start, window_end)
-    |
-    v
-LSTMAEScoreCaller OP (HTTP POST to localhost:8000/v1/score)
+NYCADScorer OP (internal 336-row sliding buffer, HTTP POST to localhost:8000/v1/score)
+    |  - Buffers raw CSV rows, assembles weekly windows internally
     |  - API returns 204 for non-Sunday / training-era windows (OP skips send())
     |  - API returns 200 with score for Sunday-aligned test windows (~10ms)
+    |  - Emits results via in-place WAEvent data[] modification
     v
-LSTMAEResultStream (is_anomaly, anomaly_score, threshold, window_start, window_end)
+NYCADResultStream (Global.WAEvent: data[0..4] = result fields)
     |
     v
-ProjectResults CQ (re-projects fields for JSONFormatter compatibility)
+NYCADFormatResults CQ (extracts data[0..4] into named fields)
     |
     v
-FormattedResultStream (Striim-generated type)
+NYCADFormattedStream (is_anomaly, anomaly_score, threshold, window_start, window_end)
     |
     v
-ResultFile (FileWriter + JSONFormatter -> /tmp/lstmae_test/scored_output)
+NYCADResultFile (FileWriter + JSONFormatter -> /tmp/nycad_test/scored_output)
 ```
 
 ---
+
+### Repo Structure
+
+```
+striim/
+├── NYCAD.tql                         # Application TQL
+└── nycad-scorer/
+    ├── build.sh                      # One-command build + install script
+    ├── pom.xml                       # Maven config (shade plugin, no types dependency)
+    ├── target/
+    │   └── NYCADScorer.scm           # Pre-built module (committed to repo)
+    └── src/
+        └── main/java/com/striim/nycad/
+            └── NYCADScorer.java
+```
+
+### Prerequisites for Building
+
+**Java:** OpenJDK 11. On macOS with Homebrew: `/opt/homebrew/opt/openjdk@11`.
+
+**Maven** 3.9+ for compiling the Open Processor Java module.
+
+**Striim runtime JAR:** The OP annotation uses `com.webaction.proc.events.WAEvent.class`, which is not in the SDK. `build.sh` installs the Striim server JAR containing this class (`Common-5.2.0.4.jar`) as a provided Maven dependency.
+
 
 ## Environment Reference
 
@@ -434,16 +427,16 @@ ResultFile (FileWriter + JSONFormatter -> /tmp/lstmae_test/scored_output)
 |---|---|
 | Striim Platform | 5.2.0.4 at `$STRIIM_HOME` |
 | Scoring API | `http://localhost:8000` |
-| Namespace | `lstmae` |
-| OP module | `LSTMAEScoreCaller` (loaded from `$STRIIM_HOME/modules/`) |
-| Types JAR | `$STRIIM_HOME/lib/lstmae_types.jar` (must be present at boot for runtime) |
-| Data file | `data/nyc_taxi_sunday_aligned.csv` (copy to `/tmp/lstmae_test/` after app starts) |
-| Output | `/tmp/lstmae_test/scored_output.00`, `.01`, etc. |
+| Namespace | `nycad` |
+| Application | `nycad.NYCAD_LSTMAE` |
+| OP module | `NYCADScorer` (loaded from `$STRIIM_HOME/modules/`) |
+| Data file | `data/nyc_taxi_sunday_aligned.csv` (copy to `/tmp/nycad_test/` after app starts) |
+| Output | `/tmp/nycad_test/scored_output.00`, `.01`, etc. |
 | Striim logs | `$STRIIM_HOME/logs/striim.server.log` |
 | API logs | Terminal where uvicorn is running |
 | Model artifacts | `models/lstm_model.pt`, `scaler.pkl`, `scorer.pkl` |
 | Window size | 336 rows (7 days x 48 half-hour intervals) |
-| Window type | Count-based sliding (`KEEP 336 ROWS PARTITION BY series_key`) |
+| Buffering | Internal to the OP (ArrayList-based sliding window) |
 | Scoring | Window-level Mahalanobis distance on reconstruction error |
 | Threshold | 5,097,651 (calibrated on training data at 99.99th percentile) |
-
+| Annotation type | `com.webaction.proc.events.WAEvent` (runtime class from `Common-5.2.0.4.jar`) |
