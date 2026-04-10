@@ -10,6 +10,8 @@ This project accompanies a forthcoming blog post about the prototype and its des
 
 The modeling approach is based on [Malhotra et al. (2016)](https://arxiv.org/abs/1607.00148): "LSTM-based Encoder-Decoder for Multi-sensor Anomaly Detection"
 
+<img width="1768" height="1185" alt="image" src="https://github.com/user-attachments/assets/846ff700-0e3b-4b09-83b7-66631e9799f2" />
+
 ---
 
 ## Repository Guide
