@@ -17,6 +17,16 @@ dependencies = [
     "matplotlib>=3.10.8",
     "jupyter>=1.0.0",
     "ipykernel>=6.0.0",
+    # jsonschema (transitive via jupyter) tries to use rfc3987 for URI format
+    # validation. If it isn't installed, jsonschema falls back to rfc3987_syntax
+    # which compiles a Lark grammar at import time and takes ~minutes, hanging
+    # `jupyter notebook` startup. Pinning rfc3987 here forces the fast path.
+    "rfc3987>=1.3.8",
+    # FastAPI scoring service used by striim/api/main.py for the Striim
+    # Open Processor integration.
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "pydantic>=2.5.0",
 ]
 
 [project.optional-dependencies]
