@@ -36,6 +36,19 @@ ANOMALY_WINDOWS = [
     ("2015-01-24 20:30:00", "2015-01-29 03:30:00"),  # Blizzard
 ]
 
+# Edge-case weeks: weeks that sit adjacent to a labeled anomaly and tend to
+# carry residual disruption (e.g. the week immediately after New Year's, the
+# unusually cold mid-January week before the blizzard). These are excluded
+# from precision/recall computation but still surfaced in the per-week table
+# so the evaluator can see what the model did with them.
+#
+# Each entry is a week start date in YYYY-MM-DD form (matching the
+# `year_week` field of week_info, which is the week's first timestamp).
+EDGE_CASE_WEEKS = {
+    "2015-01-04",  # week immediately after the New Year anomaly
+    "2015-01-18",  # cold-snap week one week before the blizzard
+}
+
 
 @dataclass
 class PreprocessorConfig:
@@ -158,6 +171,7 @@ def segment_into_weeks(
             "start_date": week_start,
             "end_date": week_end,
             "is_anomaly": contains_anomaly,
+            "is_edge_case": week_name in EDGE_CASE_WEEKS,
             "mean_value": values.mean(),
             "std_value": values.std(),
         })

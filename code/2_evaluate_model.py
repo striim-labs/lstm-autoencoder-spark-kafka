@@ -1,10 +1,20 @@
 """
-Step 4: Evaluate Model
-Load trained artifacts, evaluate on test set, generate performance plots.
+Step 2: Evaluate Model
+
+Loads training artifacts from a directory and evaluates the model on the
+held-out NYC taxi test set using window-level Mahalanobis scoring.
+Defaults to `models/initial/` (the baseline output of step 1); pass
+`--model-dir models/best` for the grid-sweep winner from step 4, or
+`--model-dir models` for the prebuilt reference.
+
+Reports precision / recall / F1, prints a per-week table, and saves
+diagnostic plots to `evaluation/`. See `notebooks/model_design.ipynb`
+for the underlying scoring methodology.
 
 Usage:
-    python code/4_evaluate_model.py
-    python code/4_evaluate_model.py --no-plots
+    python code/2_evaluate_model.py
+    python code/2_evaluate_model.py --model-dir models/best
+    python code/2_evaluate_model.py --no-plots
 """
 
 import argparse
@@ -25,15 +35,15 @@ from src.model import EncDecAD, ModelConfig
 from src.scorer import AnomalyScorer
 from src.preprocess import (
     PreprocessorConfig,
-    ANOMALY_WINDOWS,
     preprocess_pipeline,
     get_test_week_info,
 )
 
 # Register old module paths so pickled artifacts (saved with old names) can be loaded
-import src.model, src.scorer
+import src.model, src.scorer, src.preprocess
 sys.modules["lstm_autoencoder"] = src.model
 sys.modules["anomaly_scorer"] = src.scorer
+sys.modules["data_preprocessor"] = src.preprocess
 
 try:
     import matplotlib.pyplot as plt
@@ -54,71 +64,24 @@ def load_model(model_path: str, device: torch.device) -> EncDecAD:
     return model
 
 
-def evaluate_point_level(model, scorer, test_loader, test_week_info, device):
-    """Evaluate point-level and window-level anomaly detection."""
-    import pandas as pd
-
-    point_scores, window_scores, _ = scorer.compute_point_scores(model, test_loader, device)
-    point_predictions = scorer.predict_points(point_scores)
-    window_predictions = scorer.predict_windows_from_points(point_predictions)
-    window_actuals = np.array([w["is_anomaly"] for w in test_week_info])
-
-    # Window-level metrics
-    w_tp = np.sum(window_predictions & window_actuals)
-    w_fp = np.sum(window_predictions & ~window_actuals)
-    w_fn = np.sum(~window_predictions & window_actuals)
-    w_tn = np.sum(~window_predictions & ~window_actuals)
-
-    w_precision = w_tp / (w_tp + w_fp) if (w_tp + w_fp) > 0 else 0
-    w_recall = w_tp / (w_tp + w_fn) if (w_tp + w_fn) > 0 else 0
-    w_f1 = 2 * w_precision * w_recall / (w_precision + w_recall) if (w_precision + w_recall) > 0 else 0
-
-    # Point-level ground truth
-    point_actuals = np.zeros_like(point_predictions, dtype=bool)
-    for i, week in enumerate(test_week_info):
-        for j in range(point_scores.shape[1]):
-            point_time = pd.Timestamp(week["start_date"]) + pd.Timedelta(minutes=30 * j)
-            for start, end in ANOMALY_WINDOWS:
-                if pd.Timestamp(start) <= point_time <= pd.Timestamp(end):
-                    point_actuals[i, j] = True
-                    break
-
-    p_tp = np.sum(point_predictions & point_actuals)
-    p_fp = np.sum(point_predictions & ~point_actuals)
-    p_fn = np.sum(~point_predictions & point_actuals)
-    p_tn = np.sum(~point_predictions & ~point_actuals)
-
-    p_precision = p_tp / (p_tp + p_fp) if (p_tp + p_fp) > 0 else 0
-    p_recall = p_tp / (p_tp + p_fn) if (p_tp + p_fn) > 0 else 0
-    p_f1 = 2 * p_precision * p_recall / (p_precision + p_recall) if (p_precision + p_recall) > 0 else 0
-
-    return {
-        "point_scores": point_scores,
-        "point_predictions": point_predictions,
-        "point_actuals": point_actuals,
-        "window_scores": window_scores,
-        "window_predictions": window_predictions,
-        "window_actuals": window_actuals,
-        "week_info": test_week_info,
-        "point_threshold": scorer.point_threshold,
-        "hard_criterion_k": scorer.config.hard_criterion_k,
-        "point_metrics": {"tp": int(p_tp), "fp": int(p_fp), "fn": int(p_fn), "tn": int(p_tn),
-                          "precision": float(p_precision), "recall": float(p_recall), "f1": float(p_f1)},
-        "window_metrics": {"tp": int(w_tp), "fp": int(w_fp), "fn": int(w_fn), "tn": int(w_tn),
-                           "precision": float(w_precision), "recall": float(w_recall), "f1": float(w_f1)},
-    }
-
-
 def evaluate_window_level(model, scorer, test_loader, test_week_info, device):
-    """Evaluate window-level anomaly detection (legacy)."""
+    """
+    Evaluate window-level Mahalanobis anomaly detection on the test set.
+
+    Edge-case weeks (`is_edge_case=True`) are excluded from precision /
+    recall / F1 but kept in the returned arrays so callers can still
+    display them.
+    """
     scores, errors = scorer.compute_scores(model, test_loader, device)
     predictions = scorer.predict(scores)
     actuals = np.array([w["is_anomaly"] for w in test_week_info])
+    edge_mask = np.array([w.get("is_edge_case", False) for w in test_week_info])
+    scored_mask = ~edge_mask
 
-    tp = np.sum(predictions & actuals)
-    fp = np.sum(predictions & ~actuals)
-    fn = np.sum(~predictions & actuals)
-    tn = np.sum(~predictions & ~actuals)
+    tp = int(np.sum(predictions[scored_mask] & actuals[scored_mask]))
+    fp = int(np.sum(predictions[scored_mask] & ~actuals[scored_mask]))
+    fn = int(np.sum(~predictions[scored_mask] & actuals[scored_mask]))
+    tn = int(np.sum(~predictions[scored_mask] & ~actuals[scored_mask]))
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
@@ -126,9 +89,11 @@ def evaluate_window_level(model, scorer, test_loader, test_week_info, device):
 
     return {
         "scores": scores, "errors": errors, "predictions": predictions,
-        "actuals": actuals, "week_info": test_week_info, "threshold": scorer.threshold,
-        "metrics": {"tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
-                    "precision": float(precision), "recall": float(recall), "f1": float(f1)},
+        "actuals": actuals, "edge_mask": edge_mask,
+        "week_info": test_week_info, "threshold": scorer.threshold,
+        "metrics": {"tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                    "precision": float(precision), "recall": float(recall), "f1": float(f1),
+                    "n_scored": int(scored_mask.sum()), "n_edge": int(edge_mask.sum())},
     }
 
 
@@ -292,7 +257,11 @@ def plot_weekly_comparison(model, sequences, week_info, device, save_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate LSTM Anomaly Detection")
-    parser.add_argument("--model-dir", type=str, default=str(PROJECT_ROOT / "models"))
+    parser.add_argument("--model-dir", type=str, default=str(PROJECT_ROOT / "models" / "initial"),
+                        help="Directory containing lstm_model.pt, scaler.pkl, scorer.pkl, etc. "
+                             "Defaults to models/initial/ (baseline from step 1). "
+                             "Use --model-dir models/best for the grid-sweep winner from step 4, "
+                             "or --model-dir models for the prebuilt reference.")
     parser.add_argument("--data-path", type=str, default=str(PROJECT_ROOT / "data" / "nyc_taxi.csv"))
     parser.add_argument("--output-dir", type=str, default=str(PROJECT_ROOT / "evaluation"))
     parser.add_argument("--no-plots", action="store_true")
@@ -328,74 +297,60 @@ def main():
         args.data_path, config=preprocess_config, batch_size=1
     )
 
-    use_point_level = scorer.mu_point is not None and scorer.point_threshold is not None
-    scoring_mode = "point" if use_point_level else "window"
-    print(f"\nScoring mode: {scoring_mode}-level")
+    if scorer.mu is None or scorer.cov is None or scorer.threshold is None:
+        raise RuntimeError(
+            "Loaded scorer is missing window-level Mahalanobis state (mu/cov/threshold). "
+            "Re-train with code/1_train_model.py (or run code/4_grid_sweep.py)."
+        )
 
     # Compute train scores for distribution plot
     train_scores, _ = scorer.compute_scores(model, dataloaders["train"], device)
     test_week_info = get_test_week_info(week_info, split_indices)
 
-    # Evaluate
-    if use_point_level:
-        results = evaluate_point_level(model, scorer, dataloaders["test"], test_week_info, device)
-        wm = results["window_metrics"]
-        pm = results["point_metrics"]
+    results = evaluate_window_level(model, scorer, dataloaders["test"], test_week_info, device)
+    m = results["metrics"]
 
-        print("\n" + "=" * 60)
-        print("EVALUATION REPORT")
-        print("=" * 60)
-        print(f"\nWindow-Level: Precision={wm['precision']:.2%}  Recall={wm['recall']:.2%}  F1={wm['f1']:.2%}")
-        print(f"Point-Level:  Precision={pm['precision']:.2%}  Recall={pm['recall']:.2%}  F1={pm['f1']:.2%}")
+    print("\n" + "=" * 60)
+    print("EVALUATION REPORT")
+    print("=" * 60)
+    print(f"\nPrecision={m['precision']:.2%}  Recall={m['recall']:.2%}  F1={m['f1']:.2%}")
+    print(f"(over {m['n_scored']} scored weeks; {m['n_edge']} edge-case weeks excluded)")
 
-        print(f"\n{'Week':<10} {'MaxScore':>12} {'AnomalyPts':>12} {'Predicted':>10} {'Actual':>10} {'Match':>6}")
-        print("-" * 66)
-        for i, week in enumerate(test_week_info):
-            pred_str = "ANOMALY" if results["window_predictions"][i] else "normal"
-            actual_str = "ANOMALY" if results["window_actuals"][i] else "normal"
-            match = "Y" if results["window_predictions"][i] == results["window_actuals"][i] else "N"
-            print(f"{week['year_week']:<10} {results['window_scores'][i]:>12.2f} "
-                  f"{results['point_predictions'][i].sum():>12d} {pred_str:>10} {actual_str:>10} {match:>6}")
+    print(f"\n{'Week':<12} {'Score':>14} {'Predicted':>10} {'Actual':>10} {'Match':>6}")
+    print("-" * 56)
+    for score, pred, actual, edge, week in zip(
+        results["scores"], results["predictions"], results["actuals"],
+        results["edge_mask"], test_week_info,
+    ):
+        pred_str = "ANOMALY" if pred else "normal"
+        actual_str = "ANOMALY" if actual else "normal"
+        if edge:
+            tag, match = "(edge)", "-"
+        else:
+            tag, match = week["year_week"], ("Y" if pred == actual else "N")
+        label = f"{week['year_week']}{' *' if edge else ''}"
+        print(f"{label:<12} {score:>14.2f} {pred_str:>10} {actual_str:>10} {match:>6}")
+    print("\n* = edge-case week, excluded from precision/recall/F1")
 
-        test_scores = results["window_scores"]
-        test_actuals = results["window_actuals"]
-    else:
-        results = evaluate_window_level(model, scorer, dataloaders["test"], test_week_info, device)
-        m = results["metrics"]
-
-        print("\n" + "=" * 60)
-        print("EVALUATION REPORT")
-        print("=" * 60)
-        print(f"\nPrecision={m['precision']:.2%}  Recall={m['recall']:.2%}  F1={m['f1']:.2%}")
-
-        print(f"\n{'Week':<10} {'Score':>14} {'Predicted':>10} {'Actual':>10} {'Match':>6}")
-        print("-" * 54)
-        for score, pred, actual, week in zip(results["scores"], results["predictions"], results["actuals"], test_week_info):
-            pred_str = "ANOMALY" if pred else "normal"
-            actual_str = "ANOMALY" if actual else "normal"
-            match = "Y" if pred == actual else "N"
-            print(f"{week['year_week']:<10} {score:>14.2f} {pred_str:>10} {actual_str:>10} {match:>6}")
-
-        test_scores = results["scores"]
-        test_actuals = results["actuals"]
+    test_scores = results["scores"]
+    test_actuals = results["actuals"]
 
     # Generate plots
     if not args.no_plots and HAS_MATPLOTLIB:
         print("\nGenerating plots...")
-        plot_training_history(history, save_path=output_dir / f"training_history_{scoring_mode}.png")
+        plot_training_history(history, save_path=output_dir / "training_history.png")
 
-        threshold = scorer.threshold if scorer.threshold else test_scores.max()
-        plot_score_distribution(train_scores, test_scores, test_actuals, threshold,
-                                save_path=output_dir / f"score_distribution_{scoring_mode}.png")
+        plot_score_distribution(train_scores, test_scores, test_actuals, scorer.threshold,
+                                save_path=output_dir / "score_distribution.png")
 
         plot_weekly_comparison(model, normalized_splits["test"], test_week_info, device,
-                               save_path=output_dir / f"weekly_comparison_{scoring_mode}.png")
+                               save_path=output_dir / "weekly_comparison.png")
 
         for i, week in enumerate(test_week_info):
             if week["is_anomaly"]:
                 plot_reconstruction(model, normalized_splits["test"][i], device,
                                     title=f"Week {week['year_week']}",
-                                    save_path=output_dir / f"reconstruction_{week['year_week']}_{scoring_mode}.png")
+                                    save_path=output_dir / f"reconstruction_{week['year_week']}.png")
 
         print(f"Plots saved to {output_dir}/")
 

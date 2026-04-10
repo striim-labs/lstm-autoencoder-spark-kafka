@@ -221,3 +221,8 @@ models/credit_card/**
 models/credit_card_fix1_2/**
 models/credit_card_fix1_2_4/**
 data/creditcard.csv
+
+# User-trained artifacts (created locally by code/1_train_model.py and code/4_grid_sweep.py).
+# Only the prebuilt reference at models/lstm_model.pt etc. is committed.
+models/initial/
+models/best/

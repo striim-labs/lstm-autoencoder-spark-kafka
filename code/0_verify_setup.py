@@ -58,7 +58,7 @@ def main():
             size_kb = path.stat().st_size / 1024
             print(f"  {name}: {size_kb:.1f} KB")
         else:
-            print(f"  {name}: NOT FOUND (run code/3_train_model.py to train)")
+            print(f"  {name}: NOT FOUND (run code/1_train_model.py to train)")
 
     print("\n" + "=" * 60)
     print("Verify Setup complete")

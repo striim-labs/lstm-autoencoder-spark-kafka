@@ -1,10 +1,34 @@
 """
-Step 6: Streaming Application
-Real-time anomaly detection on NYC taxi demand data using
-Kafka streaming, Spark Structured Streaming, and Dash visualization.
+Step 3: Streaming Application
 
-This is the Docker entrypoint for the real-time demo.
-Run via: docker compose up --build
+Real-time anomaly detection demo over NYC taxi demand: Kafka producer ->
+Spark Structured Streaming consumer -> trained LSTM Encoder-Decoder ->
+Dash dashboard at http://localhost:8050.
+
+WHEN TO USE THIS SCRIPT
+-----------------------
+Run it after you have a trained model in `models/` (either the prebuilt
+artifacts that ship with the repo, or your own output from
+`code/1_train_model.py` or `code/4_grid_sweep.py`) and you want to see
+the detector running on a live stream rather than a batch evaluation.
+
+This is the Docker entrypoint -- DO NOT run it directly with `python`.
+Spark, Kafka, Zookeeper, and the producer service are all expected on
+the docker network. Launch the full stack with:
+
+    MESSAGE_DELAY_SECONDS=0.005 START_OFFSET=4944 LOOP_DATA=false \\
+        docker compose up --build
+
+Then open http://localhost:8050. See the README "Run the real-time
+streaming demo" section for more.
+
+Configuration is via environment variables:
+    MODEL_PATH, SCALER_PATH, SCORER_PATH   paths inside the container
+    LSTM_WINDOW_SIZE                       336 (one week at 30-min res)
+    VISUALIZATION_WEEKS                    how many weeks to plot live
+    START_OFFSET                           record index to start from
+    LOOP_DATA                              loop the CSV continuously
+    MESSAGE_DELAY_SECONDS                  inter-message pacing
 """
 
 import os

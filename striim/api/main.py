@@ -138,7 +138,7 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Scoring logic (mirrors detect_anomalies from code/5_streaming_app.py)
+# Scoring logic (mirrors detect_anomalies from code/3_streaming_app.py)
 # ---------------------------------------------------------------------------
 def score_window(values: List[float], window_start: Optional[str], window_end: Optional[str]) -> ScoreResponse:
     """Score a single 336-point window for anomalies."""

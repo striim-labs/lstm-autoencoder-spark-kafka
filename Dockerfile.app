@@ -33,7 +33,7 @@ RUN uv pip install --system \
     "matplotlib>=3.10.8"
 
 # Copy application code
-COPY code/5_streaming_app.py ./main.py
+COPY code/3_streaming_app.py ./main.py
 COPY src/ ./src/
 
 # Create models directory (will be mounted as volume)
